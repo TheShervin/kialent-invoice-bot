@@ -22,7 +22,7 @@ import shutil
 import requests
 import openpyxl
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -168,6 +168,62 @@ def get_compatible_vehicles_for_item(row_id: str, part_name: str = "") -> str:
     except Exception:
         pass
     return "مطابق کاتالوگ رسمی شرکت کیالنت البرز نور"
+
+
+# ردیف‌های پایه خودروهای ایرانی (افزایش ۲۰٪ در سفارش خرد):
+# پراید (۱)، پیکان (۲)، پژو ۴۰۵ (۳)، ال ۹۰ (۴)، سمند ملی (۵)، دنا (۶)، تیبا/ریو (۷)،
+# پژو ۲۰۶ تیپ ۲ و ۵ (۸، ۹، ۱۰)، رانا (۱۱، ۱۲)، مزدا وانت (۱۳)، نیسان دیزل (۱۴)
+IRANIAN_20_PERCENT_BASE_ROWS = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+
+# کلمات کلیدی خودروهای چینی، شاسی‌بلند و خارجی + شاهین، ماکسیما، پاترول و... (افزایش ۴۰٪ در سفارش خرد)
+FOREIGN_CHINESE_SUV_40_KEYWORDS = [
+    "شاهین", "آریو", "ماکسیما", "پاترول", "پیکاپ", "رونیز", "سرانزا", "دلیکا", "کاپرا",
+    "زانتیا", "مگان", "برلیانس", "جک", "هایما", "MVM", "ام وی ام", "ام‌وی‌ام", "X22", "X33", "X55",
+    "تیگو", "آریزو", "فونیکس", "فیدلیتی", "دیگنیتی", "لاماری", "کوپا", "ریگان", "KMC", "کی ام سی",
+    "تویوتا", "کرولا", "کمری", "پرادو", "راوفور", "RAV4", "هیوندای", "آزرا", "سوناتا", "توسان",
+    "سانتافه", "سراتو", "اپتیما", "اسپورتیج", "تالیسمان", "کولیوس", "مزدا 3", "مزدا ۳", "چانگان", "لیفان",
+]
+
+
+def is_40_percent_retail_item(row_id: str, part_name: str = "") -> bool:
+    """
+    تشخیص اینکه آیا کالا در حالت «سفارش خرد» مشمول ۴۰٪ افزایش قیمت است یا ۲۰٪:
+    - ایرانی‌ها (ردیف‌های ۱ تا ۱۴): ۲۰٪ افزایش
+    - چینی‌ها، شاسی‌بلندها و خارجی‌ها (ردیف‌های ۱۵ تا ۶۱ شامل شاهین، ماکسیما، پاترول، زانتیا، مگان و...): ۴۰٪ افزایش
+    """
+    name_norm = (part_name or "").strip()
+    for kw in FOREIGN_CHINESE_SUV_40_KEYWORDS:
+        if kw.lower() in name_norm.lower():
+            return True
+    try:
+        s_clean = to_en_str(str(row_id).strip()).split('_')[0]
+        m = re.match(r'^(\d+)', s_clean)
+        base_row = int(m.group(1)) if m else int(float(s_clean))
+        if base_row >= 15:
+            return True
+        if base_row in IRANIAN_20_PERCENT_BASE_ROWS:
+            return False
+    except Exception:
+        pass
+    return False
+
+
+def calculate_final_unit_price(base_price: int, row_id: str, part_name: str, order_mode: str = "wholesale") -> tuple:
+    """
+    محاسبه قیمت نهایی هر دست لنت بر اساس نوع سفارش:
+    - wholesale (سفارش عمده): همان قیمت پایه اکسل (۰٪ افزایش)
+    - retail (سفارش خرد): ایرانی‌ها +۲۰٪ و چینی/شاسی‌بلند/خارجی (شامل شاهین، ماکسیما، پاترول و...) +۴۰٪
+    خروجی: (قیمت نهایی به ریال، درصد افزایش اعمال‌شده)
+    """
+    if base_price is None:
+        return None, 0
+    if order_mode != "retail":
+        return int(base_price), 0
+
+    if is_40_percent_retail_item(row_id, part_name):
+        return int(round(base_price * 1.40)), 40
+    else:
+        return int(round(base_price * 1.20)), 20
 
 
 # ==============================================================================
@@ -545,7 +601,7 @@ def parse_json_from_llm(content: str) -> dict:
 
 
 def call_openrouter_models(
-    messages: list, models_list: list, catalog: list, source_text: str = ""
+    messages: list, models_list: list, catalog: list, source_text: str = "", order_mode: str = "wholesale"
 ) -> dict:
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -579,7 +635,7 @@ def call_openrouter_models(
                 continue
 
             parsed = parse_json_from_llm(content)
-            return validate_and_price_order(parsed, catalog, source_text=source_text)
+            return validate_and_price_order(parsed, catalog, source_text=source_text, order_mode=order_mode)
 
         except Exception as e:
             logger.warning(f"Error with model {model_name}: {e}")
@@ -589,17 +645,17 @@ def call_openrouter_models(
     raise RuntimeError(f"خطا در دریافت پاسخ از مدل‌های رایگان OpenRouter: {last_error}")
 
 
-def extract_order_from_text(user_text: str, catalog: list) -> dict:
+def extract_order_from_text(user_text: str, catalog: list, order_mode: str = "wholesale") -> dict:
     cleaned_text = normalize_automotive_stt_text(user_text)
     system_prompt = build_system_prompt(catalog)
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": cleaned_text},
     ]
-    return call_openrouter_models(messages, FREE_TEXT_MODELS, catalog, source_text=cleaned_text)
+    return call_openrouter_models(messages, FREE_TEXT_MODELS, catalog, source_text=cleaned_text, order_mode=order_mode)
 
 
-def extract_order_from_image(image_bytes: bytes, mime_type: str, caption: str, catalog: list) -> dict:
+def extract_order_from_image(image_bytes: bytes, mime_type: str, caption: str, catalog: list, order_mode: str = "wholesale") -> dict:
     system_prompt = build_system_prompt(catalog)
     b64_img = base64.b64encode(image_bytes).decode("utf-8")
     user_prompt = (
@@ -622,7 +678,7 @@ def extract_order_from_image(image_bytes: bytes, mime_type: str, caption: str, c
             ],
         },
     ]
-    return call_openrouter_models(messages, FREE_VISION_MODELS, catalog, source_text="")
+    return call_openrouter_models(messages, FREE_VISION_MODELS, catalog, source_text="", order_mode=order_mode)
 
 
 def transcribe_audio_high_accuracy(audio_path: str, audio_format: str = "ogg") -> str:
@@ -728,9 +784,22 @@ def transcribe_audio_high_accuracy(audio_path: str, audio_format: str = "ogg") -
     return normalize_automotive_stt_text(raw_text)
 
 
-def validate_and_price_order(parsed: dict, catalog: list, source_text: str = "") -> dict:
+def apply_order_mode_pricing_to_items(items: list, order_mode: str = "wholesale") -> list:
+    """بروزرسانی قیمت واحد اقلام بر اساس حالت سفارش (عمده یا خرد)"""
+    for item in items:
+        base_p = item.get("base_unit_price", item.get("unit_price"))
+        final_p, pct = calculate_final_unit_price(
+            base_p, item.get("row_id", ""), item.get("base_name", item.get("name", "")), order_mode
+        )
+        item["base_unit_price"] = base_p
+        item["unit_price"] = final_p
+        item["markup_percent"] = pct
+    return items
+
+
+def validate_and_price_order(parsed: dict, catalog: list, source_text: str = "", order_mode: str = "wholesale") -> dict:
     """
-    تطبیق قطعی قیمت‌ها با فایل اکسل و افزودن لیست خودروهای سازگار (اشتراکات) بر اساس ردیف دقیق کالا در کاتالوگ جامع
+    تطبیق قطعی قیمت‌ها با فایل اکسل، اعمال ضریب سفارش عمده/خرد و افزودن لیست خودروهای سازگار (اشتراکات)
     """
     by_row = {c["row_id"]: c for c in catalog}
     by_wva = {}
@@ -754,12 +823,16 @@ def validate_and_price_order(parsed: dict, catalog: list, source_text: str = "")
             warnings.append(f"کالای «{it.get('display_name', wva)}» در لیست اکسل یافت نشد.")
             continue
 
-        unit_price = matched["price_with_shim"] if with_shim else matched["price_no_shim"]
-        if unit_price is None:
+        base_unit_price = matched["price_with_shim"] if with_shim else matched["price_no_shim"]
+        if base_unit_price is None:
             warnings.append(
                 f"کالای «{matched['name']}» ({matched['wva']}) در حال حاضر در لیست قیمت خط تیره (-) است و قیمت ندارد."
             )
             continue
+
+        final_unit_price, markup_pct = calculate_final_unit_price(
+            base_unit_price, matched["row_id"], matched["name"], order_mode=order_mode
+        )
 
         display_name = it.get("display_name") or matched["name"]
         if with_shim and "شیم" not in display_name:
@@ -772,7 +845,9 @@ def validate_and_price_order(parsed: dict, catalog: list, source_text: str = "")
                 "name": display_name,
                 "base_name": matched["name"],
                 "qty": qty,
-                "unit_price": unit_price,
+                "base_unit_price": base_unit_price,
+                "unit_price": final_unit_price,
+                "markup_percent": markup_pct,
                 "with_shim": with_shim,
                 "compatible_cars": get_compatible_vehicles_for_item(
                     matched["row_id"], matched["name"]
@@ -784,6 +859,7 @@ def validate_and_price_order(parsed: dict, catalog: list, source_text: str = "")
 
     return {
         "doc_type": parsed.get("doc_type", "پیش‌فاکتور"),
+        "order_mode": order_mode,
         "customer_title": final_customer_title,
         "date": parsed.get("date") or get_today_jalali(),
         "invoice_no": parsed.get("invoice_no", "........................."),
@@ -1296,26 +1372,79 @@ def generate_pdf_bytes(order_data: dict) -> bytes:
 
 
 # ==============================================================================
-# ۸. هندلرهای ربات تلگرام (متن، ویس، عکس و فایل اکسل)
+# ۸. هندلرهای ربات تلگرام (متن، ویس، عکس، فایل اکسل و انتخاب سفارش عمده / خرد)
 # ==============================================================================
 LAST_ORDERS = {}
 PENDING_VOICE_TEXTS = {}
 AWAITING_VOICE_EDIT = set()
+USER_ORDER_MODES = {}  # chat_id -> "wholesale" (سفارش عمده) یا "retail" (سفارش خرد)
+
+BTN_WHOLESALE_TEXT = "📦 سفارش عمده"
+BTN_RETAIl_TEXT = "🛍 سفارش خرد"
+
+
+def get_user_order_mode(chat_id: int) -> str:
+    return USER_ORDER_MODES.get(chat_id, "wholesale")
+
+
+def get_order_mode_label(order_mode: str) -> str:
+    if order_mode == "retail":
+        return "🛍 سفارش خرد (ایرانی +۲۰٪ | چینی، شاسی‌بلند و خارجی +۴۰٪)"
+    return "📦 سفارش عمده (قیمت پایه لیست اکسل)"
+
+
+def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(BTN_WHOLESALE_TEXT), KeyboardButton(BTN_RETAIl_TEXT)]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def get_start_mode_inline_keyboard(current_mode: str) -> InlineKeyboardMarkup:
+    w_check = "✅ " if current_mode == "wholesale" else ""
+    r_check = "✅ " if current_mode == "retail" else ""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"{w_check}📦 سفارش عمده (قیمت لیست)", callback_data="set_mode_wholesale"
+                ),
+                InlineKeyboardButton(
+                    f"{r_check}🛍 سفارش خرد (+۲۰٪ و +۴۰٪)", callback_data="set_mode_retail"
+                ),
+            ]
+        ]
+    )
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id not in USER_ORDER_MODES:
+        USER_ORDER_MODES[chat_id] = "wholesale"
+    current_mode = get_user_order_mode(chat_id)
+
     welcome = (
         "سلام! به ربات هوشمند صدور فاکتور و پیش‌فاکتور **شرکت کیالنت البرز نور** خوش آمدید.\n\n"
-        "✨ **قابلیت‌های ربات:**\n"
-        "1️⃣ **ارسال متن سفارش:** سفارش مشتری را تایپ کنید.\n"
-        "2️⃣ **ارسال ویس (پیام صوتی):** سفارش را به صورت صوتی بگویید تا ربات خودش پیاده‌سازی و فاکتور کند.\n"
-        "3️⃣ **ارسال عکس سفارش:** از دست‌نویس یا لیست سفارش عکس بگیرید و بفرستید.\n"
-        "4️⃣ **صفحه دوم خودکار (جدول اشتراکات):** در صفحه دوم PDF، لیست کامل خودروهای سازگار هر لنت دقیقاً مطابق کاتالوگ جامع شرکت درج می‌شود.\n"
-        "5️⃣ **تشخیص عنوان مشتری:** برای آقایان «جناب آقای» و برای خانم‌ها «سرکار خانم» درج می‌شود (و فقط اگر نام لوازم یدکی را بگویید، بعد از نام مشتری نوشته می‌شود).\n\n"
-        "🔄 **بروزرسانی لیست قیمت:**\n"
-        "هر زمان لیست قیمت جدید داشتید، کافیست فایل اکسل (`.xlsx`) جدید را در همین چت بفرستید."
+        "👇 **لطفاً ابتدا نوع سفارش را از دکمه‌های زیر انتخاب کنید:**\n"
+        "• **📦 سفارش عمده:** محاسبه دقیقاً با قیمت پایه لیست اکسل\n"
+        "• **🛍 سفارش خرد:** خودروهای ایرانی **۲۰٪** و خودروهای چینی، شاسی‌بلند و خارجی (شامل شاهین، ماکسیما، پاترول و...) **۴۰٪** بالاتر از لیست عمده\n\n"
+        f"📌 **حالت فعلی شما:** `{get_order_mode_label(current_mode)}`\n\n"
+        "✨ **روش‌های ثبت سفارش:**\n"
+        "1️⃣ **متن سفارش:** سفارش مشتری را تایپ کنید.\n"
+        "2️⃣ **ویس (پیام صوتی):** سفارش را بگویید تا ابتدا متن آن برای تایید به شما نمایش داده شود و سپس فاکتور گردد.\n"
+        "3️⃣ **عکس سفارش:** از دست‌نویس یا لیست سفارش عکس بفرستید."
     )
-    await update.message.reply_text(welcome, parse_mode="Markdown")
+    await update.message.reply_text(
+        welcome,
+        parse_mode="Markdown",
+        reply_markup=get_main_reply_keyboard(),
+    )
+    await update.message.reply_text(
+        "🔘 **انتخاب سریع نوع قیمت‌گذاری:**",
+        parse_mode="Markdown",
+        reply_markup=get_start_mode_inline_keyboard(current_mode),
+    )
 
 
 async def handle_excel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1341,6 +1470,9 @@ async def send_invoice_pdf(
     context: ContextTypes.DEFAULT_TYPE,
     extra_note: str = None,
 ):
+    order_mode = order_data.get("order_mode", get_user_order_mode(chat_id))
+    apply_order_mode_pricing_to_items(order_data["items"], order_mode=order_mode)
+
     pdf_bytes = generate_pdf_bytes(order_data)
     doc_type = order_data["doc_type"]
     cust = order_data["customer_title"]
@@ -1348,9 +1480,11 @@ async def send_invoice_pdf(
 
     total_payable = sum(i["qty"] * i["unit_price"] for i in order_data["items"])
     total_qty = sum(i["qty"] for i in order_data["items"])
+    mode_label = "سفارش خرد (+۲۰٪ ایرانی / +۴۰٪ چینی، شاسی‌بلند و خارجی)" if order_mode == "retail" else "سفارش عمده (قیمت لیست)"
 
     caption = (
         f"📄 **{doc_type} سفارش {cust}**\n"
+        f"🏷 نوع قیمت‌گذاری: `{mode_label}`\n"
         f"📅 تاریخ: `{to_fa_num(order_data['date'])}`\n"
         f"📦 تعداد کل: `{to_fa_num(total_qty)}` دست ({to_fa_num(len(order_data['items']))} ردیف)\n"
         f"💰 مبلغ قابل پرداخت: `{to_fa_num(total_payable, comma=True)} ریال`\n"
@@ -1363,13 +1497,19 @@ async def send_invoice_pdf(
         caption += "\n\n⚠️ **تذکر:**\n" + "\n".join(f"• {w}" for w in order_data["warnings"])
 
     opposite_type = "فاکتور" if doc_type == "پیش‌فاکتور" else "پیش‌فاکتور"
+    opposite_mode_label = "🛍 تغییر این فاکتور به «سفارش خرد»" if order_mode == "wholesale" else "📦 تغییر این فاکتور به «سفارش عمده»"
     keyboard = InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
                     f"🔄 تبدیل فوری به «{opposite_type}»", callback_data="toggle_doctype"
                 )
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    opposite_mode_label, callback_data="toggle_ordermode"
+                )
+            ],
         ]
     )
 
@@ -1387,16 +1527,45 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     chat_id = update.effective_chat.id
 
+    # بررسی کلیک روی دکمه‌های کیبورد «سفارش عمده» و «سفارش خرد»
+    if user_text in (BTN_WHOLESALE_TEXT, "سفارش عمده", "عمده"):
+        USER_ORDER_MODES[chat_id] = "wholesale"
+        await update.message.reply_text(
+            "✅ حالت قیمت‌گذاری روی **«📦 سفارش عمده»** تنظیم شد.\n"
+            "از این لحظه تمامی فاکتورها با **قیمت پایه لیست اکسل** صادر می‌شوند.\n\n"
+            "حالا می‌توانید متن، ویس یا عکس سفارش را ارسال کنید.",
+            parse_mode="Markdown",
+            reply_markup=get_main_reply_keyboard(),
+        )
+        return
+
+    if user_text in (BTN_RETAIl_TEXT, "سفارش خرد", "خرد"):
+        USER_ORDER_MODES[chat_id] = "retail"
+        await update.message.reply_text(
+            "✅ حالت قیمت‌گذاری روی **«🛍 سفارش خرد»** تنظیم شد.\n"
+            "از این لحظه در فاکتورها:\n"
+            "• خودروهای **ایرانی**: **۲۰٪ گران‌تر**\n"
+            "• خودروهای **چینی، شاسی‌بلند و خارجی** (شامل شاهین، ماکسیما، پاترول و...): **۴۰٪ گران‌تر** محاسبه می‌شوند.\n\n"
+            "حالا می‌توانید متن، ویس یا عکس سفارش را ارسال کنید.",
+            parse_mode="Markdown",
+            reply_markup=get_main_reply_keyboard(),
+        )
+        return
+
     # اگر کاربر در حالت ویرایش متن ویس بود، متن جدیدش را به عنوان متن اصلاح‌شده ویس پردازش می‌کنیم
     was_editing_voice = chat_id in AWAITING_VOICE_EDIT
     AWAITING_VOICE_EDIT.discard(chat_id)
     PENDING_VOICE_TEXTS.pop(chat_id, None)
 
+    order_mode = get_user_order_mode(chat_id)
+    mode_short = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
     cleaned_text = normalize_automotive_stt_text(user_text)
-    wait_msg = await update.message.reply_text("⏳ در حال بررسی لیست قیمت و صدور فاکتور ۲ صفحه‌ای...")
+    wait_msg = await update.message.reply_text(
+        f"⏳ در حال بررسی لیست قیمت ({mode_short}) و صدور فاکتور ۲ صفحه‌ای..."
+    )
     try:
         catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
-        order_data = extract_order_from_text(cleaned_text, catalog)
+        order_data = extract_order_from_text(cleaned_text, catalog, order_mode=order_mode)
 
         if not order_data["items"]:
             warn_txt = "\n".join(order_data.get("warnings", []))
@@ -1447,6 +1616,7 @@ async def handle_voice_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         PENDING_VOICE_TEXTS[chat_id] = transcribed
         AWAITING_VOICE_EDIT.discard(chat_id)
+        current_mode = get_user_order_mode(chat_id)
 
         keyboard = InlineKeyboardMarkup(
             [
@@ -1469,6 +1639,7 @@ async def handle_voice_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
         confirm_msg = (
             "🎙 **متن تشخیص داده شده از ویس شما:**\n\n"
             f"`{transcribed}`\n\n"
+            f"🏷 **نوع سفارش فعلی:** `{get_order_mode_label(current_mode)}`\n\n"
             "❓ **آیا این متن مورد تایید است؟**\n"
             "_(اگر قسمتی نیاز به تغییر دارد، می‌توانید متن بالا را با ضربه زدن کپی، اصلاح و ارسال کنید یا دکمه زیر را بزنید)_"
         )
@@ -1488,14 +1659,18 @@ async def handle_photo_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     photo = update.message.photo[-1]
     caption = update.message.caption or ""
 
-    wait_msg = await update.message.reply_text("🖼 در حال خواندن تصویر سفارش و استخراج اقلام فاکتور...")
+    order_mode = get_user_order_mode(chat_id)
+    mode_short = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
+    wait_msg = await update.message.reply_text(
+        f"🖼 در حال خواندن تصویر سفارش ({mode_short}) و استخراج اقلام فاکتور..."
+    )
     try:
         catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
         tg_file = await context.bot.get_file(photo.file_id)
         img_byte_arr = await tg_file.download_as_bytearray()
 
         order_data = extract_order_from_image(
-            bytes(img_byte_arr), "image/jpeg", caption, catalog
+            bytes(img_byte_arr), "image/jpeg", caption, catalog, order_mode=order_mode
         )
 
         if not order_data["items"]:
@@ -1519,7 +1694,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     chat_id = query.message.chat_id
 
-    if query.data == "confirm_voice_order":
+    if query.data == "set_mode_wholesale":
+        USER_ORDER_MODES[chat_id] = "wholesale"
+        await query.edit_message_text(
+            "✅ حالت قیمت‌گذاری روی **«📦 سفارش عمده»** تنظیم شد (محاسبه با قیمت پایه لیست اکسل).",
+            parse_mode="Markdown",
+            reply_markup=get_start_mode_inline_keyboard("wholesale"),
+        )
+
+    elif query.data == "set_mode_retail":
+        USER_ORDER_MODES[chat_id] = "retail"
+        await query.edit_message_text(
+            "✅ حالت قیمت‌گذاری روی **«🛍 سفارش خرد»** تنظیم شد (ایرانی **+۲۰٪** | چینی، شاسی‌بلند و خارجی شامل شاهین، ماکسیما و پاترول **+۴۰٪**).",
+            parse_mode="Markdown",
+            reply_markup=get_start_mode_inline_keyboard("retail"),
+        )
+
+    elif query.data == "confirm_voice_order":
         transcribed = PENDING_VOICE_TEXTS.pop(chat_id, None)
         AWAITING_VOICE_EDIT.discard(chat_id)
         if not transcribed:
@@ -1528,13 +1719,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        order_mode = get_user_order_mode(chat_id)
+        mode_short = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
         await query.edit_message_text(
-            f"✅ **متن تایید شد:**\n`{transcribed}`\n\n⏳ در حال ارسال به هوش مصنوعی و صدور فاکتور ۲ صفحه‌ای...",
+            f"✅ **متن تایید شد:**\n`{transcribed}`\n\n⏳ در حال ارسال به هوش مصنوعی و صدور فاکتور ۲ صفحه‌ای ({mode_short})...",
             parse_mode="Markdown",
         )
         try:
             catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
-            order_data = extract_order_from_text(transcribed, catalog)
+            order_data = extract_order_from_text(transcribed, catalog, order_mode=order_mode)
             if not order_data["items"]:
                 warn_txt = "\n".join(order_data.get("warnings", []))
                 await query.edit_message_text(
@@ -1578,6 +1771,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_data["doc_type"] = (
             "فاکتور" if order_data["doc_type"] == "پیش‌فاکتور" else "پیش‌فاکتور"
         )
+        await send_invoice_pdf(chat_id, order_data, context)
+
+    elif query.data == "toggle_ordermode":
+        order_data = LAST_ORDERS.get(chat_id)
+        if not order_data:
+            await query.message.reply_text(
+                "⚠️ اطلاعات این سفارش در حافظه موقت یافت نشد. لطفاً مجدداً سفارش را بفرستید."
+            )
+            return
+
+        new_mode = "retail" if order_data.get("order_mode", "wholesale") == "wholesale" else "wholesale"
+        order_data["order_mode"] = new_mode
+        USER_ORDER_MODES[chat_id] = new_mode
+        apply_order_mode_pricing_to_items(order_data["items"], order_mode=new_mode)
         await send_invoice_pdf(chat_id, order_data, context)
 
 
