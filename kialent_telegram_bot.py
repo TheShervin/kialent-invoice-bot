@@ -645,6 +645,119 @@ def call_openrouter_models(
     raise RuntimeError(f"خطا در دریافت پاسخ از مدل‌های رایگان OpenRouter: {last_error}")
 
 
+
+def format_full_catalog_with_compatibility(catalog: list, order_mode: str = "wholesale") -> str:
+    """
+    آماده‌سازی بانک اطلاعات کامل محصولات کیالنت البرز نور شامل:
+    ردیف، کد فنی، نام قطعه، قیمت با شیم و بدون شیم (متناسب با حالت عمده/خرد کاربر) و لیست کامل خودروهای سازگار (اشتراکات)
+    """
+    lines = [
+        "ردیف | کد فنی | نام لنت تولیدی کیالنت البرز نور | قیمت بدون شیم (ریال) | قیمت با شیم (ریال) | خودروهای سازگار و مشترک (اشتراکات)"
+    ]
+    seen_base_rows = set()
+    for item in catalog:
+        p_no_base = item["price_no_shim"]
+        p_yes_base = item["price_with_shim"]
+        p_no_final, _ = calculate_final_unit_price(p_no_base, item["row_id"], item["name"], order_mode)
+        p_yes_final, _ = calculate_final_unit_price(p_yes_base, item["row_id"], item["name"], order_mode)
+
+        p_no_str = f"{p_no_final:,}" if p_no_final else "ناموجود"
+        p_yes_str = f"{p_yes_final:,}" if p_yes_final else "ناموجود"
+        compat = get_compatible_vehicles_for_item(item["row_id"], item["name"])
+        lines.append(
+            f"{item['row_id']} | {item['wva']} | {item['name']} | {p_no_str} | {p_yes_str} | {compat}"
+        )
+    return "\n".join(lines)
+
+
+def answer_catalog_question(user_question: str, catalog: list, order_mode: str = "wholesale") -> str:
+    """
+    پاسخگویی هوشمند و دقیق به سوالات فنی مشتریان درباره:
+    - اشتراکات لنت‌ها (اینکه هر لنت به چه ماشین‌هایی می‌خورد یا برای یک ماشین خاص چه لنتی در سبد محصولات داریم)
+    - لیست لنت‌های تولیدی شرکت کیالنت البرز نور
+    - شرایط فروش (حداقل خرید عمده ۱ کارتن معادل ۱۰ دست لنت و تسویه نقدی)
+    """
+    full_kb = format_full_catalog_with_compatibility(catalog, order_mode=order_mode)
+    system_prompt = f"""شما کارشناس فنی و مشاور فروش رسمی «شرکت کیالنت البرز نور» (تولیدکننده لنت ترمز خودرو) هستید.
+وظیفه شما پاسخگویی دقیق، محترمانه، روان و کامل به سوالات مشتریان بر اساس بانک اطلاعات رسمی کاتالوگ زیر است:
+
+=== کاتالوگ جامع محصولات، قیمت‌ها و اشتراکات لنت‌های شرکت کیالنت البرز نور ===
+{full_kb}
+
+=== قوانین و شرایط فروش شرکت ===
+- حداقل خرید عمده: یک کارتن یا معادل ۱۰ دست لنت می‌باشد.
+- نحوه تسویه: تمامی سفارشات به صورت نقدی تسویه می‌شوند.
+- هرگز درباره درصد تفاوت قیمت خرد و عمده (۲۰٪ یا ۴۰٪) صحبت نکنید؛ اگر مشتری قیمت پرسید، فقط قیمت نهایی درج‌شده در جدول بالا را به ریال (یا تومان) اعلام کنید.
+- اگر مشتری پرسید «چه لنت‌هایی دارید؟»، دسته‌بندی کامل لنت‌های تولیدی ما (ایرانی، چینی، شاسی‌بلند و وارداتی) را به صورت مرتب و خوانا معرفی کنید.
+- اگر مشتری پرسید «لنت فلان ماشین به چه ماشین‌هایی می‌خورد؟» یا «برای فلان ماشین چه لنتی دارید و با چی مشترکه؟»، دقیقاً از ستون «خودروهای سازگار و مشترک (اشتراکات)» در جدول بالا استفاده کنید و کد فنی و تمام خودروهای مشترک آن را کامل بنویسید.
+- پاسخ را با فرمت زیبا، بولت‌بندی شده و اعداد فارسی بنویسید."""
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://t.me/KialentInvoiceBot",
+        "X-Title": "Kialent Alborz Noor Technical QA",
+    }
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_question},
+    ]
+
+    last_error = None
+    for model_name in FREE_TEXT_MODELS:
+        try:
+            payload = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": 0.2,
+            }
+            resp = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=45,
+            )
+            if resp.status_code != 200:
+                last_error = f"HTTP {resp.status_code}"
+                continue
+            data = resp.json()
+            ans = data["choices"][0]["message"]["content"]
+            if ans and ans.strip():
+                return ans.strip()
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    raise RuntimeError(f"خطا در دریافت پاسخ از مشاور هوشمند: {last_error}")
+
+
+def is_question_or_catalog_inquiry(text: str) -> bool:
+    """
+    تشخیص هوشمند اینکه پیام کاربر یک «سوال فنی / استعلام اشتراکات / موجودی لنت‌ها» است یا یک «سفارش صدور فاکتور»
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    # اگر صراحتاً کلمه فاکتور یا پیش‌فاکتور همراه با تعداد/سفارش آمده باشد، سفارش است مگر سوالی باشد
+    order_triggers = ["فاکتور کن", "پیش فاکتور کن", "پیش‌فاکتور کن", "فاکتور بزن", "سفارش خانم", "سفارش آقای", "سفارش اقای"]
+    if any(tr in t for tr in order_triggers) and "؟" not in t and "چی میخوره" not in t and "مشترک" not in t:
+        return False
+
+    qa_keywords = [
+        "؟", "?", "اشتراک", "مشترک", "میخوره", "می‌خوره", "میخورد", "می‌خورد",
+        "کدوم لنت", "کدام لنت", "چه لنت", "لنت چی", "لنت های", "لنت‌های",
+        "لیست لنت", "سوال", "بپرسم", "شرایط خرید", "حداقل خرید", "چند دست",
+        "کارتن", "سازگار", "معادل", "به چی میخوره", "به چه ماشینی", "دارید", "دارین",
+    ]
+    if any(kw in t for kw in qa_keywords):
+        # بررسی کنیم اگر پیام حاوی الگوی سفارش چند قلمه نیست، سوال تلقی شود
+        if not any(tr in t for tr in order_triggers):
+            return True
+    return False
+
+
 def extract_order_from_text(user_text: str, catalog: list, order_mode: str = "wholesale") -> dict:
     cleaned_text = normalize_automotive_stt_text(user_text)
     system_prompt = build_system_prompt(catalog)
@@ -1372,15 +1485,17 @@ def generate_pdf_bytes(order_data: dict) -> bytes:
 
 
 # ==============================================================================
-# ۸. هندلرهای ربات تلگرام (متن، ویس، عکس، فایل اکسل و انتخاب سفارش عمده / خرد)
+# ۸. هندلرهای ربات تلگرام (متن، ویس، عکس، فایل اکسل، سفارش عمده/خرد و پرسش‌وپاسخ فنی)
 # ==============================================================================
 LAST_ORDERS = {}
 PENDING_VOICE_TEXTS = {}
 AWAITING_VOICE_EDIT = set()
+AWAITING_QUESTION_MODE = set()  # کاربرانی که روی دکمه «سوالی داری ازم بپرس» کلیک کرده‌اند
 USER_ORDER_MODES = {}  # chat_id -> "wholesale" (سفارش عمده) یا "retail" (سفارش خرد)
 
 BTN_WHOLESALE_TEXT = "📦 سفارش عمده"
 BTN_RETAIl_TEXT = "🛍 سفارش خرد"
+BTN_ASK_QUESTION_TEXT = "❓ اگر سوالی داری ازم بپرس (اشتراکات و لیست لنت‌ها)"
 
 
 def get_user_order_mode(chat_id: int) -> str:
@@ -1389,13 +1504,16 @@ def get_user_order_mode(chat_id: int) -> str:
 
 def get_order_mode_label(order_mode: str) -> str:
     if order_mode == "retail":
-        return "🛍 سفارش خرد (ایرانی +۲۰٪ | چینی، شاسی‌بلند و خارجی +۴۰٪)"
-    return "📦 سفارش عمده (قیمت پایه لیست اکسل)"
+        return "🛍 سفارش خرد"
+    return "📦 سفارش عمده"
 
 
 def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[KeyboardButton(BTN_WHOLESALE_TEXT), KeyboardButton(BTN_RETAIl_TEXT)]],
+        [
+            [KeyboardButton(BTN_WHOLESALE_TEXT), KeyboardButton(BTN_RETAIl_TEXT)],
+            [KeyboardButton(BTN_ASK_QUESTION_TEXT)],
+        ],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -1408,12 +1526,18 @@ def get_start_mode_inline_keyboard(current_mode: str) -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
-                    f"{w_check}📦 سفارش عمده (قیمت لیست)", callback_data="set_mode_wholesale"
+                    f"{w_check}📦 سفارش عمده", callback_data="set_mode_wholesale"
                 ),
                 InlineKeyboardButton(
-                    f"{r_check}🛍 سفارش خرد (+۲۰٪ و +۴۰٪)", callback_data="set_mode_retail"
+                    f"{r_check}🛍 سفارش خرد", callback_data="set_mode_retail"
                 ),
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    "❓ اگر سوالی داری ازم بپرس (اشتراکات و انواع لنت‌ها)",
+                    callback_data="ask_technical_question",
+                )
+            ],
         ]
     )
 
@@ -1422,18 +1546,17 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id not in USER_ORDER_MODES:
         USER_ORDER_MODES[chat_id] = "wholesale"
+    AWAITING_QUESTION_MODE.discard(chat_id)
     current_mode = get_user_order_mode(chat_id)
 
     welcome = (
-        "سلام! به ربات هوشمند صدور فاکتور و پیش‌فاکتور **شرکت کیالنت البرز نور** خوش آمدید.\n\n"
-        "👇 **لطفاً ابتدا نوع سفارش را از دکمه‌های زیر انتخاب کنید:**\n"
-        "• **📦 سفارش عمده:** محاسبه دقیقاً با قیمت پایه لیست اکسل\n"
-        "• **🛍 سفارش خرد:** خودروهای ایرانی **۲۰٪** و خودروهای چینی، شاسی‌بلند و خارجی (شامل شاهین، ماکسیما، پاترول و...) **۴۰٪** بالاتر از لیست عمده\n\n"
-        f"📌 **حالت فعلی شما:** `{get_order_mode_label(current_mode)}`\n\n"
-        "✨ **روش‌های ثبت سفارش:**\n"
-        "1️⃣ **متن سفارش:** سفارش مشتری را تایپ کنید.\n"
-        "2️⃣ **ویس (پیام صوتی):** سفارش را بگویید تا ابتدا متن آن برای تایید به شما نمایش داده شود و سپس فاکتور گردد.\n"
-        "3️⃣ **عکس سفارش:** از دست‌نویس یا لیست سفارش عکس بفرستید."
+        "سلام! به سامانه هوشمند فروش و مشاوره فنی **شرکت کیالنت البرز نور** خوش آمدید.\n\n"
+        "📌 **شرایط فروش و ثبت سفارش:**\n"
+        "• **حداقل خرید عمده، یک کارتن یا معادل ۱۰ دست لنت می‌باشد.**\n"
+        "• **تمامی سفارشات به صورت نقدی تسویه می‌شوند.**\n\n"
+        "👇 **لطفاً از دکمه‌های زیر نوع سفارش خود را انتخاب کنید یا سوال فنی خود را بپرسید:**\n"
+        "1️⃣ **📦 سفارش عمده** یا **🛍 سفارش خرد** (امکان ارسال سفارش به صورت **متن، ویس یا عکس**)\n"
+        "2️⃣ **❓ پرسش و مشاوره فنی:** اگر درباره **اشتراکات لنت‌ها**، اینکه **چه لنت‌هایی تولید می‌کنیم** یا **کدام لنت به کدام خودرو می‌خورد** سوالی دارید، دکمه زیر را بزنید و بپرسید."
     )
     await update.message.reply_text(
         welcome,
@@ -1441,7 +1564,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_main_reply_keyboard(),
     )
     await update.message.reply_text(
-        "🔘 **انتخاب سریع نوع قیمت‌گذاری:**",
+        f"🔘 **بخش مورد نظر خود را انتخاب کنید** (حالت فعلی: `{get_order_mode_label(current_mode)}`):",
         parse_mode="Markdown",
         reply_markup=get_start_mode_inline_keyboard(current_mode),
     )
@@ -1480,11 +1603,11 @@ async def send_invoice_pdf(
 
     total_payable = sum(i["qty"] * i["unit_price"] for i in order_data["items"])
     total_qty = sum(i["qty"] for i in order_data["items"])
-    mode_label = "سفارش خرد (+۲۰٪ ایرانی / +۴۰٪ چینی، شاسی‌بلند و خارجی)" if order_mode == "retail" else "سفارش عمده (قیمت لیست)"
+    mode_label = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
 
     caption = (
         f"📄 **{doc_type} سفارش {cust}**\n"
-        f"🏷 نوع قیمت‌گذاری: `{mode_label}`\n"
+        f"🏷 نوع سفارش: `{mode_label}`\n"
         f"📅 تاریخ: `{to_fa_num(order_data['date'])}`\n"
         f"📦 تعداد کل: `{to_fa_num(total_qty)}` دست ({to_fa_num(len(order_data['items']))} ردیف)\n"
         f"💰 مبلغ قابل پرداخت: `{to_fa_num(total_payable, comma=True)} ریال`\n"
@@ -1497,7 +1620,7 @@ async def send_invoice_pdf(
         caption += "\n\n⚠️ **تذکر:**\n" + "\n".join(f"• {w}" for w in order_data["warnings"])
 
     opposite_type = "فاکتور" if doc_type == "پیش‌فاکتور" else "پیش‌فاکتور"
-    opposite_mode_label = "🛍 تغییر این فاکتور به «سفارش خرد»" if order_mode == "wholesale" else "📦 تغییر این فاکتور به «سفارش عمده»"
+    opposite_mode_label = "🛍 تغییر به «سفارش خرد»" if order_mode == "wholesale" else "📦 تغییر به «سفارش عمده»"
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -1527,33 +1650,65 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     chat_id = update.effective_chat.id
 
-    # بررسی کلیک روی دکمه‌های کیبورد «سفارش عمده» و «سفارش خرد»
+    # ۱. بررسی کلیک روی دکمه «سفارش عمده»
     if user_text in (BTN_WHOLESALE_TEXT, "سفارش عمده", "عمده"):
         USER_ORDER_MODES[chat_id] = "wholesale"
+        AWAITING_QUESTION_MODE.discard(chat_id)
         await update.message.reply_text(
-            "✅ حالت قیمت‌گذاری روی **«📦 سفارش عمده»** تنظیم شد.\n"
-            "از این لحظه تمامی فاکتورها با **قیمت پایه لیست اکسل** صادر می‌شوند.\n\n"
-            "حالا می‌توانید متن، ویس یا عکس سفارش را ارسال کنید.",
+            "✅ بخش **«📦 سفارش عمده»** انتخاب شد.\n"
+            "📌 **توجه:** حداقل خرید عمده، **یک کارتن یا معادل ۱۰ دست لنت** می‌باشد و **تمامی سفارشات نقدی تسویه می‌شوند**.\n\n"
+            "حالا می‌توانید سفارش خود را به صورت **متن، ویس یا عکس** ارسال فرمایید.",
             parse_mode="Markdown",
             reply_markup=get_main_reply_keyboard(),
         )
         return
 
+    # ۲. بررسی کلیک روی دکمه «سفارش خرد»
     if user_text in (BTN_RETAIl_TEXT, "سفارش خرد", "خرد"):
         USER_ORDER_MODES[chat_id] = "retail"
+        AWAITING_QUESTION_MODE.discard(chat_id)
         await update.message.reply_text(
-            "✅ حالت قیمت‌گذاری روی **«🛍 سفارش خرد»** تنظیم شد.\n"
-            "از این لحظه در فاکتورها:\n"
-            "• خودروهای **ایرانی**: **۲۰٪ گران‌تر**\n"
-            "• خودروهای **چینی، شاسی‌بلند و خارجی** (شامل شاهین، ماکسیما، پاترول و...): **۴۰٪ گران‌تر** محاسبه می‌شوند.\n\n"
-            "حالا می‌توانید متن، ویس یا عکس سفارش را ارسال کنید.",
+            "✅ بخش **«🛍 سفارش خرد»** انتخاب شد.\n"
+            "📌 **توجه:** **تمامی سفارشات به صورت نقدی تسویه می‌شوند.**\n\n"
+            "حالا می‌توانید سفارش خود را به صورت **متن، ویس یا عکس** ارسال فرمایید.",
             parse_mode="Markdown",
             reply_markup=get_main_reply_keyboard(),
         )
         return
 
-    # اگر کاربر در حالت ویرایش متن ویس بود، متن جدیدش را به عنوان متن اصلاح‌شده ویس پردازش می‌کنیم
+    # ۳. بررسی کلیک روی دکمه «اگر سوالی داری ازم بپرس»
+    if user_text in (BTN_ASK_QUESTION_TEXT, "سوال", "سوال فنی", "اشتراکات لنت"):
+        AWAITING_QUESTION_MODE.add(chat_id)
+        await update.message.reply_text(
+            "💬 **مشاور فنی و راهنمای کاتالوگ کیالنت البرز نور آماده پاسخگویی است!**\n\n"
+            "هر سوالی دارید بپرسید؛ برای مثال:\n"
+            "• _«چه لنت‌هایی تولید می‌کنید؟»_\n"
+            "• _«لنت جلو جک S5 یا شاهین به چه ماشین‌های دیگه‌ای می‌خوره؟»_\n"
+            "• _«برای پژو ۲۰۷ یا تیگو ۷ چه لنتی دارید و اشتراکاتش چیه؟»_\n\n"
+            "✍️ لطفاً سوال خود را تایپ کنید:",
+            parse_mode="Markdown",
+            reply_markup=get_main_reply_keyboard(),
+        )
+        return
+
+    # ۴. اگر کاربر در حالت ویرایش متن ویس نبود، بررسی می‌کنیم آیا پیامش سوال فنی/استعلام اشتراکات است
     was_editing_voice = chat_id in AWAITING_VOICE_EDIT
+    if not was_editing_voice and (
+        chat_id in AWAITING_QUESTION_MODE or is_question_or_catalog_inquiry(user_text)
+    ):
+        AWAITING_QUESTION_MODE.discard(chat_id)
+        order_mode = get_user_order_mode(chat_id)
+        wait_qa = await update.message.reply_text("🔍 در حال بررسی کاتالوگ جامع و اشتراکات لنت‌ها...")
+        try:
+            catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
+            answer = answer_catalog_question(user_text, catalog, order_mode=order_mode)
+            await wait_qa.edit_text(answer)
+        except Exception as e:
+            logger.exception("Error answering catalog question")
+            await wait_qa.edit_text(f"❌ خطا در دریافت پاسخ:\n`{e}`", parse_mode="Markdown")
+        return
+
+    # ۵. پردازش به عنوان سفارش فاکتور / پیش‌فاکتور
     AWAITING_VOICE_EDIT.discard(chat_id)
     PENDING_VOICE_TEXTS.pop(chat_id, None)
 
@@ -1573,6 +1728,13 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⚠️ هیچ کالای قیمت‌داری از پیام شما استخراج نشد.\n{warn_txt}"
             )
             return
+
+        # اگر سفارش عمده است و مجموع تعداد کمتر از ۱۰ دست است، یادآوری شرایط عمده را در تذکر اضافه می‌کنیم
+        total_qty = sum(i["qty"] for i in order_data["items"])
+        if order_mode == "wholesale" and total_qty < 10:
+            order_data.setdefault("warnings", []).append(
+                f"حداقل خرید عمده ۱ کارتن (۱۰ دست لنت) می‌باشد (تعداد فعلی این فاکتور: {to_fa_num(total_qty)} دست)."
+            )
 
         LAST_ORDERS[chat_id] = order_data
         extra_note = cleaned_text if was_editing_voice else None
@@ -1680,6 +1842,12 @@ async def handle_photo_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
 
+        total_qty = sum(i["qty"] for i in order_data["items"])
+        if order_mode == "wholesale" and total_qty < 10:
+            order_data.setdefault("warnings", []).append(
+                f"حداقل خرید عمده ۱ کارتن (۱۰ دست لنت) می‌باشد (تعداد فعلی این فاکتور: {to_fa_num(total_qty)} دست)."
+            )
+
         LAST_ORDERS[chat_id] = order_data
         await send_invoice_pdf(chat_id, order_data, context)
         await wait_msg.delete()
@@ -1696,18 +1864,37 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "set_mode_wholesale":
         USER_ORDER_MODES[chat_id] = "wholesale"
+        AWAITING_QUESTION_MODE.discard(chat_id)
         await query.edit_message_text(
-            "✅ حالت قیمت‌گذاری روی **«📦 سفارش عمده»** تنظیم شد (محاسبه با قیمت پایه لیست اکسل).",
+            "✅ بخش **«📦 سفارش عمده»** انتخاب شد.\n"
+            "📌 حداقل خرید عمده، **یک کارتن یا معادل ۱۰ دست لنت** می‌باشد و **تمامی سفارشات نقدی تسویه می‌شوند**.\n\n"
+            "لطفاً سفارش خود را به صورت متن، ویس یا عکس ارسال فرمایید.",
             parse_mode="Markdown",
             reply_markup=get_start_mode_inline_keyboard("wholesale"),
         )
 
     elif query.data == "set_mode_retail":
         USER_ORDER_MODES[chat_id] = "retail"
+        AWAITING_QUESTION_MODE.discard(chat_id)
         await query.edit_message_text(
-            "✅ حالت قیمت‌گذاری روی **«🛍 سفارش خرد»** تنظیم شد (ایرانی **+۲۰٪** | چینی، شاسی‌بلند و خارجی شامل شاهین، ماکسیما و پاترول **+۴۰٪**).",
+            "✅ بخش **«🛍 سفارش خرد»** انتخاب شد.\n"
+            "📌 **تمامی سفارشات به صورت نقدی تسویه می‌شوند.**\n\n"
+            "لطفاً سفارش خود را به صورت متن، ویس یا عکس ارسال فرمایید.",
             parse_mode="Markdown",
             reply_markup=get_start_mode_inline_keyboard("retail"),
+        )
+
+    elif query.data == "ask_technical_question":
+        AWAITING_QUESTION_MODE.add(chat_id)
+        await query.message.reply_text(
+            "💬 **مشاور فنی و راهنمای کاتالوگ کیالنت البرز نور آماده پاسخگویی است!**\n\n"
+            "هر سوالی در مورد **اشتراکات لنت‌ها**، اینکه **چه لنت‌هایی داریم** یا **کدام لنت ما به کدام خودرو می‌خورد** دارید بپرسید؛ برای مثال:\n"
+            "• _«چه لنت‌هایی تولید می‌کنید؟»_\n"
+            "• _«لنت جلو جک S5 یا شاهین به چه ماشین‌هایی می‌خوره؟»_\n"
+            "• _«برای پژو ۲۰۷ یا تیگو ۷ چه لنتی دارید و اشتراکاتش چیه؟»_\n\n"
+            "✍️ لطفاً سوال خود را بنویسید:",
+            parse_mode="Markdown",
+            reply_markup=get_main_reply_keyboard(),
         )
 
     elif query.data == "confirm_voice_order":
@@ -1735,6 +1922,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown",
                 )
                 return
+
+            total_qty = sum(i["qty"] for i in order_data["items"])
+            if order_mode == "wholesale" and total_qty < 10:
+                order_data.setdefault("warnings", []).append(
+                    f"حداقل خرید عمده ۱ کارتن (۱۰ دست لنت) می‌باشد (تعداد فعلی این فاکتور: {to_fa_num(total_qty)} دست)."
+                )
 
             LAST_ORDERS[chat_id] = order_data
             await send_invoice_pdf(chat_id, order_data, context, extra_note=transcribed)
