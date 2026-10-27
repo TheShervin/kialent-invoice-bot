@@ -43,15 +43,15 @@ EXCEL_FILE_PATH = os.getenv("EXCEL_FILE_PATH", "New Microsoft Excel Worksheet.xl
 
 # لیست مدل‌های رایگان متنی OpenRouter (ابتدا روتر هوشمند رایگان و سپس مدل‌های رایگان جایگزین)
 FREE_TEXT_MODELS = [
-    "openrouter/free",
-    "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "nvidia/nemotron-3-super-120b-a12b:free",
-    "google/gemma-4-31b-it:free",
-    "google/gemma-4-26b-a4b-it:free",
     "google/gemini-2.0-flash-exp:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
     "deepseek/deepseek-chat-v3-0324:free",
     "qwen/qwen-2.5-72b-instruct:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemma-4-31b-it:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "openrouter/free",
 ]
 
 # لیست مدل‌های رایگان بینایی (Vision) برای خواندن عکس سفارش
@@ -616,7 +616,7 @@ def call_openrouter_models(
             payload = {
                 "model": model_name,
                 "messages": messages,
-                "temperature": 0.1,
+                "temperature": 0.0,
             }
             resp = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -908,6 +908,56 @@ def apply_order_mode_pricing_to_items(items: list, order_mode: str = "wholesale"
         item["unit_price"] = final_p
         item["markup_percent"] = pct
     return items
+
+
+
+def build_single_verified_item(matched: dict, qty: int, with_shim: bool, order_mode: str = "wholesale") -> dict:
+    """ساخت دیکشنری استاندارد یک ردیف کالای سفارش بر اساس ردیف کاتالوگ، تعداد و وضعیت شیم"""
+    base_unit_price = matched["price_with_shim"] if with_shim else matched["price_no_shim"]
+    if base_unit_price is None:
+        # اگر یک حالت (مثلاً با شیم یا بدون شیم) قیمت نداشت، حالت دیگر را بررسی می‌کنیم
+        alt_price = matched["price_no_shim"] if with_shim else matched["price_with_shim"]
+        if alt_price is not None:
+            with_shim = not with_shim
+            base_unit_price = alt_price
+
+    final_unit_price, markup_pct = calculate_final_unit_price(
+        base_unit_price, matched["row_id"], matched["name"], order_mode=order_mode
+    )
+    display_name = matched["name"]
+    if with_shim and "شیم" not in display_name:
+        display_name += " با شیم"
+
+    return {
+        "row_id": matched["row_id"],
+        "wva": matched["wva"],
+        "name": display_name,
+        "base_name": matched["name"],
+        "qty": max(1, int(qty)),
+        "base_unit_price": base_unit_price,
+        "unit_price": final_unit_price,
+        "markup_percent": markup_pct,
+        "with_shim": bool(with_shim),
+        "compatible_cars": get_compatible_vehicles_for_item(matched["row_id"], matched["name"]),
+    }
+
+
+def has_two_backing_plate_models(row_id: str, catalog: list) -> tuple:
+    """
+    بررسی اینکه آیا این لنت در کاتالوگ ۲ مدل کفشک (۵ میل و ۶ میل یعنی X.1 و X.2) دارد یا خیر.
+    خروجی: (True/False, row_5mm_dict, row_6mm_dict)
+    """
+    by_row = {c["row_id"]: c for c in catalog}
+    s_clean = to_en_str(str(row_id).strip()).split("_")[0]
+    m = re.match(r"^(\d+)", s_clean)
+    if not m:
+        return False, None, None
+    base_num = m.group(1)
+    r5 = by_row.get(f"{base_num}.1")
+    r6 = by_row.get(f"{base_num}.2")
+    if r5 and r6:
+        return True, r5, r6
+    return False, None, None
 
 
 def validate_and_price_order(parsed: dict, catalog: list, source_text: str = "", order_mode: str = "wholesale") -> dict:
@@ -1485,12 +1535,14 @@ def generate_pdf_bytes(order_data: dict) -> bytes:
 
 
 # ==============================================================================
-# ۸. هندلرهای ربات تلگرام (متن، ویس، عکس، فایل اکسل، سفارش عمده/خرد و پرسش‌وپاسخ فنی)
+# ۸. هندلرهای ربات تلگرام (پیش‌نمایش سفارش، اصلاح تعاملی اقلام، افزودن لنت، ویس، عکس و مشاور فنی)
 # ==============================================================================
 LAST_ORDERS = {}
 PENDING_VOICE_TEXTS = {}
 AWAITING_VOICE_EDIT = set()
-AWAITING_QUESTION_MODE = set()  # کاربرانی که روی دکمه «سوالی داری ازم بپرس» کلیک کرده‌اند
+AWAITING_QUESTION_MODE = set()
+PENDING_DRAFT_ORDERS = {}  # chat_id -> order_data در حال بررسی و اصلاح قبل از صدور PDF
+USER_EDIT_STATE = {}  # chat_id -> {"mode": "awaiting_qty", "item_idx": idx} یا {"mode": "awaiting_add_item"}
 USER_ORDER_MODES = {}  # chat_id -> "wholesale" (سفارش عمده) یا "retail" (سفارش خرد)
 
 BTN_WHOLESALE_TEXT = "📦 سفارش عمده"
@@ -1542,14 +1594,8 @@ def get_start_mode_inline_keyboard(current_mode: str) -> InlineKeyboardMarkup:
     )
 
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if chat_id not in USER_ORDER_MODES:
-        USER_ORDER_MODES[chat_id] = "wholesale"
-    AWAITING_QUESTION_MODE.discard(chat_id)
-    current_mode = get_user_order_mode(chat_id)
-
-    welcome = (
+def build_welcome_text() -> str:
+    return (
         "سلام! به سامانه هوشمند فروش و مشاوره فنی **شرکت کیالنت البرز نور** خوش آمدید.\n\n"
         "📌 **شرایط فروش و ثبت سفارش:**\n"
         "• **حداقل خرید عمده، یک کارتن یا معادل ۱۰ دست لنت می‌باشد.**\n"
@@ -1558,6 +1604,214 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1️⃣ **📦 سفارش عمده** یا **🛍 سفارش خرد** (امکان ارسال سفارش به صورت **متن، ویس یا عکس**)\n"
         "2️⃣ **❓ پرسش و مشاوره فنی:** اگر درباره **اشتراکات لنت‌ها**، اینکه **چه لنت‌هایی تولید می‌کنیم** یا **کدام لنت به کدام خودرو می‌خورد** سوالی دارید، دکمه زیر را بزنید و بپرسید."
     )
+
+
+def format_draft_order_summary(order_data: dict) -> str:
+    """نمایش شفاف لنت‌های تشخیص داده شده قبل از صدور فاکتور"""
+    order_mode = order_data.get("order_mode", "wholesale")
+    apply_order_mode_pricing_to_items(order_data["items"], order_mode=order_mode)
+
+    doc_type = order_data.get("doc_type", "پیش‌فاکتور")
+    cust = order_data.get("customer_title", "مشتری گرامی")
+    mode_label = get_order_mode_label(order_mode)
+
+    lines = [
+        f"🧾 **پیش‌نمایش {doc_type} سفارش {cust}**",
+        f"🏷 **نوع سفارش:** `{mode_label}` | 📅 **تاریخ:** `{to_fa_num(order_data.get('date', get_today_jalali()))}`",
+        "",
+        "📦 **لنت‌های تشخیص داده شده:**",
+    ]
+
+    total_payable = 0
+    total_qty = 0
+    for idx, it in enumerate(order_data.get("items", []), start=1):
+        line_total = it["qty"] * it["unit_price"]
+        total_payable += line_total
+        total_qty += it["qty"]
+        shim_str = "با شیم" if it.get("with_shim") else "بدون شیم"
+        lines.append(
+            f"{to_fa_num(idx)}. **{it['base_name']}** ({shim_str})\n"
+            f"   🔹 کد: `{it['wva']}` | تعداد: **{to_fa_num(it['qty'])} دست** | فی: `{to_fa_num(it['unit_price'], comma=True)}` | جمع: `{to_fa_num(line_total, comma=True)} ریال`"
+        )
+
+    if not order_data.get("items"):
+        lines.append("⚠️ _در حال حاضر هیچ لنتی در لیست نیست. از دکمه اصلاح/اضافه کردن استفاده کنید._")
+
+    lines.append("")
+    lines.append(f"📊 **جمع کل تعداد:** `{to_fa_num(total_qty)} دست`")
+    lines.append(f"💰 **مبلغ کل قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`")
+
+    if order_mode == "wholesale" and 0 < total_qty < 10:
+        lines.append(
+            f"\n⚠️ **توجه:** حداقل خرید عمده ۱ کارتن (۱۰ دست لنت) می‌باشد (جمع فعلی: {to_fa_num(total_qty)} دست)."
+        )
+
+    if order_data.get("warnings"):
+        lines.append("\n⚠️ **تذکر:**")
+        for w in order_data["warnings"]:
+            lines.append(f"• {w}")
+
+    lines.append("\n❓ **آیا اقلام بالا مورد تایید است یا نیاز به اصلاح دارد؟**")
+    return "\n".join(lines)
+
+
+def get_draft_summary_keyboard() -> InlineKeyboardMarkup:
+    """سه دکمه اصلی زیر پیش‌نمایش لنت‌های تشخیص داده شده: تایید، اصلاح، بازگشت به منوی اصلی"""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ تایید و صدور فاکتور", callback_data="draft_confirm"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "✏️ اصلاح اقلام سفارش", callback_data="draft_edit_menu"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏠 بازگشت به منوی اصلی", callback_data="back_to_main_menu"
+                )
+            ],
+        ]
+    )
+
+
+def get_draft_edit_list_keyboard(order_data: dict) -> InlineKeyboardMarkup:
+    """
+    ساخت دکمه به تعداد لنت‌های سفارش + دکمه اضافه کردن لنت جدید + تایید نهایی + بازگشت به منوی اصلی
+    """
+    buttons = []
+    for idx, it in enumerate(order_data.get("items", [])):
+        shim_label = "با شیم" if it.get("with_shim") else "بدون شیم"
+        btn_text = f"🔧 {to_fa_num(idx + 1)}. {it['base_name']} ({shim_label}) - {to_fa_num(it['qty'])} دست"
+        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"edit_item:{idx}")])
+
+    buttons.append(
+        [InlineKeyboardButton("➕ اضافه کردن لنت جدید", callback_data="draft_add_item")]
+    )
+    if order_data.get("items"):
+        buttons.append(
+            [InlineKeyboardButton("✅ تایید نهایی و صدور فاکتور", callback_data="draft_confirm")]
+        )
+    buttons.append(
+        [InlineKeyboardButton("🏠 بازگشت به منوی اصلی", callback_data="back_to_main_menu")]
+    )
+    return InlineKeyboardMarkup(buttons)
+
+
+def format_single_item_edit_text(item: dict, idx: int, total_items: int, has_5_6: bool) -> str:
+    shim_str = "✅ با شیم" if item.get("with_shim") else "❌ بدون شیم"
+    thickness_note = ""
+    if has_5_6:
+        curr_th = "۶ میل" if str(item["row_id"]).endswith(".2") else "۵ میل"
+        thickness_note = f"\n📏 **مدل کفشک (ضخامت):** `{curr_th}` (قابل تغییر بین ۵ میل و ۶ میل)"
+
+    line_total = item["qty"] * item["unit_price"]
+    return (
+        f"🔧 **ویرایش ردیف {to_fa_num(idx + 1)} از {to_fa_num(total_items)}:**\n\n"
+        f"🔹 **نام قطعه:** `{item['base_name']}`\n"
+        f"🔹 **کد فنی:** `{item['wva']}`\n"
+        f"🔹 **وضعیت شیم:** {shim_str}"
+        f"{thickness_note}\n"
+        f"🔹 **تعداد فعلی:** `{to_fa_num(item['qty'])} دست`\n"
+        f"🔹 **قیمت واحد:** `{to_fa_num(item['unit_price'], comma=True)} ریال`\n"
+        f"💰 **جمع این ردیف:** `{to_fa_num(line_total, comma=True)} ریال`\n\n"
+        "👇 از دکمه‌های زیر تعداد، وضعیت شیم یا ضخامت کفشک را تغییر دهید:"
+    )
+
+
+def get_single_item_edit_keyboard(item: dict, idx: int, catalog: list) -> InlineKeyboardMarkup:
+    """
+    کیبورد ویرایش یک لنت:
+    - تغییر تعداد (-10, -5, -1, +1, +5, +10 و تایپ عدد دلخواه)
+    - تغییر با شیم / بدون شیم
+    - اگر در کاتالوگ ۲ مدل کفشک (۵ میل و ۶ میل) دارد: دکمه تغییر ۵ میل / ۶ میل
+    - حذف این ردیف
+    - بازگشت به لیست اقلام / تایید و صدور فاکتور
+    """
+    rows = []
+
+    # ۱. دکمه‌های کم و زیاد کردن سریع تعداد
+    rows.append(
+        [
+            InlineKeyboardButton("➖ ۱", callback_data=f"item_qty:{idx}:-1"),
+            InlineKeyboardButton(f"📦 تعداد: {to_fa_num(item['qty'])} دست", callback_data=f"item_custom_qty:{idx}"),
+            InlineKeyboardButton("➕ ۱", callback_data=f"item_qty:{idx}:+1"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton("➖ ۵", callback_data=f"item_qty:{idx}:-5"),
+            InlineKeyboardButton("➖ ۱۰", callback_data=f"item_qty:{idx}:-10"),
+            InlineKeyboardButton("➕ ۵", callback_data=f"item_qty:{idx}:+5"),
+            InlineKeyboardButton("➕ ۱۰", callback_data=f"item_qty:{idx}:+10"),
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton("⌨️ وارد کردن عدد دلخواه تعداد", callback_data=f"item_custom_qty:{idx}")
+        ]
+    )
+
+    # ۲. دکمه تغییر وضعیت شیم‌دار / بدون شیم
+    with_shim = item.get("with_shim", False)
+    shim_yes_mark = "✅ " if with_shim else ""
+    shim_no_mark = "✅ " if not with_shim else ""
+    rows.append(
+        [
+            InlineKeyboardButton(
+                f"{shim_yes_mark}با شیم", callback_data=f"item_shim:{idx}:1"
+            ),
+            InlineKeyboardButton(
+                f"{shim_no_mark}بدون شیم", callback_data=f"item_shim:{idx}:0"
+            ),
+        ]
+    )
+
+    # ۳. اگر در کاتالوگ ۲ مدل کفشک (۵ میل و ۶ میل) دارد، دکمه‌های ۵ میل و ۶ میل را نمایش بده
+    has_5_6, r5, r6 = has_two_backing_plate_models(item["row_id"], catalog)
+    if has_5_6:
+        is_6mm = str(item["row_id"]).endswith(".2")
+        m5_mark = "✅ " if not is_6mm else ""
+        m6_mark = "✅ " if is_6mm else ""
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{m5_mark}کفشک ۵ میل", callback_data=f"item_thick:{idx}:5"
+                ),
+                InlineKeyboardButton(
+                    f"{m6_mark}کفشک ۶ میل", callback_data=f"item_thick:{idx}:6"
+                ),
+            ]
+        )
+
+    # ۴. حذف ردیف و بازگشت به لیست
+    rows.append(
+        [
+            InlineKeyboardButton("🗑 حذف این لنت از فاکتور", callback_data=f"item_del:{idx}")
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton("🔙 بازگشت به لیست لنت‌ها", callback_data="draft_edit_menu"),
+            InlineKeyboardButton("✅ تایید و صدور فاکتور", callback_data="draft_confirm"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id not in USER_ORDER_MODES:
+        USER_ORDER_MODES[chat_id] = "wholesale"
+    AWAITING_QUESTION_MODE.discard(chat_id)
+    AWAITING_VOICE_EDIT.discard(chat_id)
+    USER_EDIT_STATE.pop(chat_id, None)
+    current_mode = get_user_order_mode(chat_id)
+
+    welcome = build_welcome_text()
     await update.message.reply_text(
         welcome,
         parse_mode="Markdown",
@@ -1633,6 +1887,11 @@ async def send_invoice_pdf(
                     opposite_mode_label, callback_data="toggle_ordermode"
                 )
             ],
+            [
+                InlineKeyboardButton(
+                    "✏️ اصلاح اقلام همین فاکتور", callback_data="reopen_last_order_edit"
+                )
+            ],
         ]
     )
 
@@ -1654,6 +1913,7 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_text in (BTN_WHOLESALE_TEXT, "سفارش عمده", "عمده"):
         USER_ORDER_MODES[chat_id] = "wholesale"
         AWAITING_QUESTION_MODE.discard(chat_id)
+        USER_EDIT_STATE.pop(chat_id, None)
         await update.message.reply_text(
             "✅ بخش **«📦 سفارش عمده»** انتخاب شد.\n"
             "📌 **توجه:** حداقل خرید عمده، **یک کارتن یا معادل ۱۰ دست لنت** می‌باشد و **تمامی سفارشات نقدی تسویه می‌شوند**.\n\n"
@@ -1667,6 +1927,7 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_text in (BTN_RETAIl_TEXT, "سفارش خرد", "خرد"):
         USER_ORDER_MODES[chat_id] = "retail"
         AWAITING_QUESTION_MODE.discard(chat_id)
+        USER_EDIT_STATE.pop(chat_id, None)
         await update.message.reply_text(
             "✅ بخش **«🛍 سفارش خرد»** انتخاب شد.\n"
             "📌 **توجه:** **تمامی سفارشات به صورت نقدی تسویه می‌شوند.**\n\n"
@@ -1679,6 +1940,7 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ۳. بررسی کلیک روی دکمه «اگر سوالی داری ازم بپرس»
     if user_text in (BTN_ASK_QUESTION_TEXT, "سوال", "سوال فنی", "اشتراکات لنت"):
         AWAITING_QUESTION_MODE.add(chat_id)
+        USER_EDIT_STATE.pop(chat_id, None)
         await update.message.reply_text(
             "💬 **مشاور فنی و راهنمای کاتالوگ کیالنت البرز نور آماده پاسخگویی است!**\n\n"
             "هر سوالی دارید بپرسید؛ برای مثال:\n"
@@ -1691,7 +1953,63 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ۴. اگر کاربر در حالت ویرایش متن ویس نبود، بررسی می‌کنیم آیا پیامش سوال فنی/استعلام اشتراکات است
+    # ۴. بررسی اینکه آیا کاربر در حال وارد کردن «عدد دلخواه تعداد» یا «افزودن لنت جدید» در منوی اصلاح است
+    edit_state = USER_EDIT_STATE.get(chat_id)
+    if edit_state and chat_id in PENDING_DRAFT_ORDERS:
+        draft = PENDING_DRAFT_ORDERS[chat_id]
+        state_mode = edit_state.get("mode")
+
+        if state_mode == "awaiting_qty":
+            idx = edit_state.get("item_idx", 0)
+            en_txt = to_en_str(user_text).strip()
+            m_num = re.search(r"(\d+)", en_txt)
+            if m_num and 0 <= idx < len(draft["items"]):
+                new_qty = max(1, int(m_num.group(1)))
+                draft["items"][idx]["qty"] = new_qty
+                USER_EDIT_STATE.pop(chat_id, None)
+                catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
+                has_5_6, _, _ = has_two_backing_plate_models(draft["items"][idx]["row_id"], catalog)
+                await update.message.reply_text(
+                    f"✅ تعداد ردیف {to_fa_num(idx + 1)} به **{to_fa_num(new_qty)} دست** تغییر یافت.\n\n"
+                    + format_single_item_edit_text(draft["items"][idx], idx, len(draft["items"]), has_5_6),
+                    parse_mode="Markdown",
+                    reply_markup=get_single_item_edit_keyboard(draft["items"][idx], idx, catalog),
+                )
+                return
+            else:
+                await update.message.reply_text("⚠️ لطفاً فقط یک عدد معتبر (مثلاً `5` یا `10`) ارسال کنید:")
+                return
+
+        elif state_mode == "awaiting_add_item":
+            USER_EDIT_STATE.pop(chat_id, None)
+            order_mode = draft.get("order_mode", get_user_order_mode(chat_id))
+            wait_add = await update.message.reply_text("⏳ در حال شناسایی لنت جدید و افزودن به لیست...")
+            try:
+                catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
+                new_parsed = extract_order_from_text(user_text, catalog, order_mode=order_mode)
+                added_items = new_parsed.get("items", [])
+                if not added_items:
+                    await wait_add.edit_text(
+                        "⚠️ لنتی از متن شما تشخیص داده نشد. لطفاً دوباره از منوی زیر امتحان کنید:",
+                        reply_markup=get_draft_edit_list_keyboard(draft),
+                    )
+                    return
+                draft["items"].extend(added_items)
+                await wait_add.edit_text(
+                    f"✅ **{to_fa_num(len(added_items))} ردیف لنت جدید** به سفارش اضافه شد!\n\n"
+                    + format_draft_order_summary(draft),
+                    parse_mode="Markdown",
+                    reply_markup=get_draft_edit_list_keyboard(draft),
+                )
+            except Exception as e:
+                await wait_add.edit_text(
+                    f"❌ خطا در افزودن لنت: `{e}`",
+                    parse_mode="Markdown",
+                    reply_markup=get_draft_edit_list_keyboard(draft),
+                )
+            return
+
+    # ۵. اگر کاربر در حالت ویرایش متن ویس نبود، بررسی می‌کنیم آیا پیامش سوال فنی/استعلام اشتراکات است
     was_editing_voice = chat_id in AWAITING_VOICE_EDIT
     if not was_editing_voice and (
         chat_id in AWAITING_QUESTION_MODE or is_question_or_catalog_inquiry(user_text)
@@ -1708,7 +2026,7 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await wait_qa.edit_text(f"❌ خطا در دریافت پاسخ:\n`{e}`", parse_mode="Markdown")
         return
 
-    # ۵. پردازش به عنوان سفارش فاکتور / پیش‌فاکتور
+    # ۶. استخراج سفارش و نمایش پیش‌نمایش اقلام همراه با ۳ دکمه (تایید / اصلاح / بازگشت به منوی اصلی)
     AWAITING_VOICE_EDIT.discard(chat_id)
     PENDING_VOICE_TEXTS.pop(chat_id, None)
 
@@ -1716,7 +2034,7 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode_short = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
     cleaned_text = normalize_automotive_stt_text(user_text)
     wait_msg = await update.message.reply_text(
-        f"⏳ در حال بررسی لیست قیمت ({mode_short}) و صدور فاکتور ۲ صفحه‌ای..."
+        f"⏳ در حال تشخیص لنت‌های سفارش ({mode_short})..."
     )
     try:
         catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
@@ -1729,17 +2047,15 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # اگر سفارش عمده است و مجموع تعداد کمتر از ۱۰ دست است، یادآوری شرایط عمده را در تذکر اضافه می‌کنیم
-        total_qty = sum(i["qty"] for i in order_data["items"])
-        if order_mode == "wholesale" and total_qty < 10:
-            order_data.setdefault("warnings", []).append(
-                f"حداقل خرید عمده ۱ کارتن (۱۰ دست لنت) می‌باشد (تعداد فعلی این فاکتور: {to_fa_num(total_qty)} دست)."
-            )
+        if was_editing_voice:
+            order_data["extra_note"] = cleaned_text
 
-        LAST_ORDERS[chat_id] = order_data
-        extra_note = cleaned_text if was_editing_voice else None
-        await send_invoice_pdf(chat_id, order_data, context, extra_note=extra_note)
-        await wait_msg.delete()
+        PENDING_DRAFT_ORDERS[chat_id] = order_data
+        await wait_msg.edit_text(
+            format_draft_order_summary(order_data),
+            parse_mode="Markdown",
+            reply_markup=get_draft_summary_keyboard(),
+        )
 
     except Exception as e:
         logger.exception("Error processing text order")
@@ -1749,7 +2065,7 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_voice_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     دریافت ویس، تبدیل به متن با دقت بالا + اصلاح اصطلاحات لنت («باشیم» -> «با شیم» و...)
-    و نمایش متن به کاربر برای تایید قبل از ارسال به هوش مصنوعی و صدور فاکتور
+    و نمایش متن به کاربر برای تایید قبل از ارسال به هوش مصنوعی
     """
     chat_id = update.effective_chat.id
     voice = update.message.voice or update.message.audio
@@ -1784,15 +2100,15 @@ async def handle_voice_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
             [
                 [
                     InlineKeyboardButton(
-                        "✅ بله، مورد تایید است (صدور فاکتور)", callback_data="confirm_voice_order"
+                        "✅ بله، متن ویس درست است (تشخیص لنت‌ها)", callback_data="confirm_voice_order"
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        "✏️ ویرایش متن", callback_data="edit_voice_order"
+                        "✏️ ویرایش متن ویس", callback_data="edit_voice_order"
                     ),
                     InlineKeyboardButton(
-                        "❌ لغو", callback_data="cancel_voice_order"
+                        "🏠 بازگشت به منوی اصلی", callback_data="back_to_main_menu"
                     ),
                 ],
             ]
@@ -1803,7 +2119,7 @@ async def handle_voice_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"`{transcribed}`\n\n"
             f"🏷 **نوع سفارش فعلی:** `{get_order_mode_label(current_mode)}`\n\n"
             "❓ **آیا این متن مورد تایید است؟**\n"
-            "_(اگر قسمتی نیاز به تغییر دارد، می‌توانید متن بالا را با ضربه زدن کپی، اصلاح و ارسال کنید یا دکمه زیر را بزنید)_"
+            "_(پس از تایید، لیست لنت‌های تشخیص داده شده نیز قبل از صدور فاکتور به شما نمایش داده می‌شود تا بتوانید تعداد، شیم یا ۵/۶ میل بودن هر لنت را با دکمه تغییر دهید)_"
         )
         await wait_msg.edit_text(
             confirm_msg,
@@ -1824,7 +2140,7 @@ async def handle_photo_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     order_mode = get_user_order_mode(chat_id)
     mode_short = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
     wait_msg = await update.message.reply_text(
-        f"🖼 در حال خواندن تصویر سفارش ({mode_short}) و استخراج اقلام فاکتور..."
+        f"🖼 در حال خواندن تصویر سفارش ({mode_short}) و تشخیص لنت‌ها..."
     )
     try:
         catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
@@ -1842,15 +2158,12 @@ async def handle_photo_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
 
-        total_qty = sum(i["qty"] for i in order_data["items"])
-        if order_mode == "wholesale" and total_qty < 10:
-            order_data.setdefault("warnings", []).append(
-                f"حداقل خرید عمده ۱ کارتن (۱۰ دست لنت) می‌باشد (تعداد فعلی این فاکتور: {to_fa_num(total_qty)} دست)."
-            )
-
-        LAST_ORDERS[chat_id] = order_data
-        await send_invoice_pdf(chat_id, order_data, context)
-        await wait_msg.delete()
+        PENDING_DRAFT_ORDERS[chat_id] = order_data
+        await wait_msg.edit_text(
+            format_draft_order_summary(order_data),
+            parse_mode="Markdown",
+            reply_markup=get_draft_summary_keyboard(),
+        )
 
     except Exception as e:
         logger.exception("Error processing photo order")
@@ -1861,8 +2174,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat_id
+    data = query.data or ""
 
-    if query.data == "set_mode_wholesale":
+    # ۱. بازگشت به منوی اصلی
+    if data == "back_to_main_menu":
+        PENDING_VOICE_TEXTS.pop(chat_id, None)
+        AWAITING_VOICE_EDIT.discard(chat_id)
+        AWAITING_QUESTION_MODE.discard(chat_id)
+        USER_EDIT_STATE.pop(chat_id, None)
+        PENDING_DRAFT_ORDERS.pop(chat_id, None)
+        current_mode = get_user_order_mode(chat_id)
+        await query.edit_message_text(
+            build_welcome_text()
+            + f"\n\n🔘 **حالت فعلی شما:** `{get_order_mode_label(current_mode)}`",
+            parse_mode="Markdown",
+            reply_markup=get_start_mode_inline_keyboard(current_mode),
+        )
+        return
+
+    # ۲. تغییر حالت سفارش عمده / خرد
+    if data == "set_mode_wholesale":
         USER_ORDER_MODES[chat_id] = "wholesale"
         AWAITING_QUESTION_MODE.discard(chat_id)
         await query.edit_message_text(
@@ -1872,8 +2203,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=get_start_mode_inline_keyboard("wholesale"),
         )
+        return
 
-    elif query.data == "set_mode_retail":
+    if data == "set_mode_retail":
         USER_ORDER_MODES[chat_id] = "retail"
         AWAITING_QUESTION_MODE.discard(chat_id)
         await query.edit_message_text(
@@ -1883,8 +2215,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=get_start_mode_inline_keyboard("retail"),
         )
+        return
 
-    elif query.data == "ask_technical_question":
+    if data == "ask_technical_question":
         AWAITING_QUESTION_MODE.add(chat_id)
         await query.message.reply_text(
             "💬 **مشاور فنی و راهنمای کاتالوگ کیالنت البرز نور آماده پاسخگویی است!**\n\n"
@@ -1896,8 +2229,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=get_main_reply_keyboard(),
         )
+        return
 
-    elif query.data == "confirm_voice_order":
+    # ۳. تایید متن ویس -> استخراج لنت‌ها و نمایش پیش‌نمایش اقلام
+    if data == "confirm_voice_order":
         transcribed = PENDING_VOICE_TEXTS.pop(chat_id, None)
         AWAITING_VOICE_EDIT.discard(chat_id)
         if not transcribed:
@@ -1909,7 +2244,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_mode = get_user_order_mode(chat_id)
         mode_short = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
         await query.edit_message_text(
-            f"✅ **متن تایید شد:**\n`{transcribed}`\n\n⏳ در حال ارسال به هوش مصنوعی و صدور فاکتور ۲ صفحه‌ای ({mode_short})...",
+            f"✅ **متن تایید شد:**\n`{transcribed}`\n\n⏳ در حال تشخیص لنت‌های سفارش ({mode_short})...",
             parse_mode="Markdown",
         )
         try:
@@ -1923,22 +2258,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-            total_qty = sum(i["qty"] for i in order_data["items"])
-            if order_mode == "wholesale" and total_qty < 10:
-                order_data.setdefault("warnings", []).append(
-                    f"حداقل خرید عمده ۱ کارتن (۱۰ دست لنت) می‌باشد (تعداد فعلی این فاکتور: {to_fa_num(total_qty)} دست)."
-                )
-
-            LAST_ORDERS[chat_id] = order_data
-            await send_invoice_pdf(chat_id, order_data, context, extra_note=transcribed)
-            await query.message.delete()
-        except Exception as e:
-            logger.exception("Error issuing invoice from confirmed voice")
+            order_data["extra_note"] = transcribed
+            PENDING_DRAFT_ORDERS[chat_id] = order_data
             await query.edit_message_text(
-                f"❌ خطا در صدور فاکتور:\n`{e}`", parse_mode="Markdown"
+                format_draft_order_summary(order_data),
+                parse_mode="Markdown",
+                reply_markup=get_draft_summary_keyboard(),
             )
+        except Exception as e:
+            logger.exception("Error extracting draft order from confirmed voice")
+            await query.edit_message_text(
+                f"❌ خطا در تحلیل سفارش:\n`{e}`", parse_mode="Markdown"
+            )
+        return
 
-    elif query.data == "edit_voice_order":
+    if data == "edit_voice_order":
         transcribed = PENDING_VOICE_TEXTS.get(chat_id, "")
         AWAITING_VOICE_EDIT.add(chat_id)
         await query.edit_message_text(
@@ -1947,13 +2281,228 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"`{transcribed}`",
             parse_mode="Markdown",
         )
+        return
 
-    elif query.data == "cancel_voice_order":
+    if data == "cancel_voice_order":
         PENDING_VOICE_TEXTS.pop(chat_id, None)
         AWAITING_VOICE_EDIT.discard(chat_id)
         await query.edit_message_text("❌ سفارش صوتی لغو شد. می‌توانید مجدداً ویس یا پیام متنی بفرستید.")
+        return
 
-    elif query.data == "toggle_doctype":
+    # ۴. مدیریت پیش‌نمایش و منوی اصلاح اقلام سفارش (PENDING_DRAFT_ORDERS)
+    if data == "reopen_last_order_edit":
+        last_ord = LAST_ORDERS.get(chat_id)
+        if not last_ord:
+            await query.message.reply_text("⚠️ سفارش قبلی در حافظه یافت نشد. لطفاً مجدداً سفارش را بفرستید.")
+            return
+        import copy
+        PENDING_DRAFT_ORDERS[chat_id] = copy.deepcopy(last_ord)
+        draft = PENDING_DRAFT_ORDERS[chat_id]
+        await query.message.reply_text(
+            "✏️ **لیست لنت‌های سفارش جهت اصلاح:**\n"
+            "روی هر لنت کلیک کنید تا **تعداد**، **با شیم / بدون شیم** یا **۵ میل / ۶ میل** بودن آن را تغییر دهید:",
+            parse_mode="Markdown",
+            reply_markup=get_draft_edit_list_keyboard(draft),
+        )
+        return
+
+    if data == "draft_confirm":
+        draft = PENDING_DRAFT_ORDERS.pop(chat_id, None)
+        USER_EDIT_STATE.pop(chat_id, None)
+        if not draft or not draft.get("items"):
+            await query.edit_message_text("⚠️ هیچ لنتی در سفارش وجود ندارد. لطفاً سفارش جدید ارسال کنید.")
+            return
+
+        order_mode = draft.get("order_mode", get_user_order_mode(chat_id))
+        total_qty = sum(i["qty"] for i in draft["items"])
+        # پاکسازی هشدارهای قبلی تعداد عمده و بررسی مجدد
+        draft["warnings"] = [
+            w for w in draft.get("warnings", []) if "حداقل خرید عمده" not in w
+        ]
+        if order_mode == "wholesale" and total_qty < 10:
+            draft["warnings"].append(
+                f"حداقل خرید عمده ۱ کارتن (۱۰ دست لنت) می‌باشد (تعداد فعلی این فاکتور: {to_fa_num(total_qty)} دست)."
+            )
+
+        await query.edit_message_text("⏳ در حال ساخت فایل PDF دو صفحه‌ای فاکتور و جدول اشتراکات...")
+        try:
+            LAST_ORDERS[chat_id] = draft
+            await send_invoice_pdf(
+                chat_id, draft, context, extra_note=draft.get("extra_note")
+            )
+            await query.message.delete()
+        except Exception as e:
+            logger.exception("Error generating final PDF")
+            await query.edit_message_text(f"❌ خطا در ساخت PDF:\n`{e}`", parse_mode="Markdown")
+        return
+
+    if data == "draft_edit_menu":
+        draft = PENDING_DRAFT_ORDERS.get(chat_id)
+        USER_EDIT_STATE.pop(chat_id, None)
+        if not draft:
+            await query.edit_message_text("⚠️ سفارش فعلی منقضی شده است. لطفاً مجدداً سفارش را ارسال کنید.")
+            return
+        await query.edit_message_text(
+            format_draft_order_summary(draft)
+            + "\n\n👇 **روی هر لنت کلیک کنید تا آن را ویرایش کنید، یا لنت جدید اضافه نمایید:**",
+            parse_mode="Markdown",
+            reply_markup=get_draft_edit_list_keyboard(draft),
+        )
+        return
+
+    if data == "draft_add_item":
+        draft = PENDING_DRAFT_ORDERS.get(chat_id)
+        if not draft:
+            await query.edit_message_text("⚠️ سفارش فعلی منقضی شده است.")
+            return
+        USER_EDIT_STATE[chat_id] = {"mode": "awaiting_add_item"}
+        await query.edit_message_text(
+            "➕ **افزودن لنت جدید به سفارش:**\n\n"
+            "لطفاً نام لنت، تعداد و شیم‌دار یا بدون شیم بودن آن را تایپ و ارسال کنید\n"
+            "_(مثال: «۳ تا لنت جلو شاهین ۶ میل با شیم» یا «۵ تا پراید بدون شیم»)_:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 انصراف و بازگشت به لیست", callback_data="draft_edit_menu")]]
+            ),
+        )
+        return
+
+    # ۵. کلیک روی یک لنت خاص برای ویرایش (edit_item:IDX)
+    if data.startswith("edit_item:"):
+        draft = PENDING_DRAFT_ORDERS.get(chat_id)
+        USER_EDIT_STATE.pop(chat_id, None)
+        if not draft:
+            await query.edit_message_text("⚠️ سفارش فعلی یافت نشد.")
+            return
+        idx = int(data.split(":")[1])
+        if not (0 <= idx < len(draft["items"])):
+            await query.edit_message_text(
+                format_draft_order_summary(draft),
+                parse_mode="Markdown",
+                reply_markup=get_draft_edit_list_keyboard(draft),
+            )
+            return
+        catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
+        item = draft["items"][idx]
+        has_5_6, _, _ = has_two_backing_plate_models(item["row_id"], catalog)
+        await query.edit_message_text(
+            format_single_item_edit_text(item, idx, len(draft["items"]), has_5_6),
+            parse_mode="Markdown",
+            reply_markup=get_single_item_edit_keyboard(item, idx, catalog),
+        )
+        return
+
+    # ۶. تغییر تعداد با دکمه‌های +1/-1/+5/-5/+10/-10 (item_qty:IDX:DELTA)
+    if data.startswith("item_qty:"):
+        draft = PENDING_DRAFT_ORDERS.get(chat_id)
+        if not draft:
+            return
+        _, idx_str, delta_str = data.split(":")
+        idx = int(idx_str)
+        delta = int(delta_str)
+        if 0 <= idx < len(draft["items"]):
+            new_q = max(1, draft["items"][idx]["qty"] + delta)
+            draft["items"][idx]["qty"] = new_q
+            catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
+            has_5_6, _, _ = has_two_backing_plate_models(draft["items"][idx]["row_id"], catalog)
+            await query.edit_message_text(
+                format_single_item_edit_text(draft["items"][idx], idx, len(draft["items"]), has_5_6),
+                parse_mode="Markdown",
+                reply_markup=get_single_item_edit_keyboard(draft["items"][idx], idx, catalog),
+            )
+        return
+
+    # ۷. درخواست تایپ عدد دلخواه برای تعداد (item_custom_qty:IDX)
+    if data.startswith("item_custom_qty:"):
+        draft = PENDING_DRAFT_ORDERS.get(chat_id)
+        if not draft:
+            return
+        idx = int(data.split(":")[1])
+        if 0 <= idx < len(draft["items"]):
+            USER_EDIT_STATE[chat_id] = {"mode": "awaiting_qty", "item_idx": idx}
+            it = draft["items"][idx]
+            await query.edit_message_text(
+                f"⌨️ لطفاً تعداد جدید برای **«{it['base_name']}»** را به صورت عدد در چت تایپ و ارسال کنید (مثلاً `12`):",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🔙 بازگشت به ویرایش همین لنت", callback_data=f"edit_item:{idx}")]]
+                ),
+            )
+        return
+
+    # ۸. تغییر وضعیت با شیم / بدون شیم (item_shim:IDX:0_OR_1)
+    if data.startswith("item_shim:"):
+        draft = PENDING_DRAFT_ORDERS.get(chat_id)
+        if not draft:
+            return
+        _, idx_str, shim_val = data.split(":")
+        idx = int(idx_str)
+        want_shim = shim_val == "1"
+        if 0 <= idx < len(draft["items"]):
+            catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
+            by_row = {c["row_id"]: c for c in catalog}
+            curr_item = draft["items"][idx]
+            matched = by_row.get(curr_item["row_id"])
+            if matched:
+                target_price = matched["price_with_shim"] if want_shim else matched["price_no_shim"]
+                if target_price is None:
+                    await query.answer("⚠️ این مدل در لیست اکسل برای حالت انتخابی قیمت ندارد!", show_alert=True)
+                    return
+                order_mode = draft.get("order_mode", get_user_order_mode(chat_id))
+                draft["items"][idx] = build_single_verified_item(
+                    matched, curr_item["qty"], want_shim, order_mode=order_mode
+                )
+            has_5_6, _, _ = has_two_backing_plate_models(draft["items"][idx]["row_id"], catalog)
+            await query.edit_message_text(
+                format_single_item_edit_text(draft["items"][idx], idx, len(draft["items"]), has_5_6),
+                parse_mode="Markdown",
+                reply_markup=get_single_item_edit_keyboard(draft["items"][idx], idx, catalog),
+            )
+        return
+
+    # ۹. تغییر ضخامت کفشک ۵ میل / ۶ میل (item_thick:IDX:5_OR_6)
+    if data.startswith("item_thick:"):
+        draft = PENDING_DRAFT_ORDERS.get(chat_id)
+        if not draft:
+            return
+        _, idx_str, thick_val = data.split(":")
+        idx = int(idx_str)
+        if 0 <= idx < len(draft["items"]):
+            catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
+            curr_item = draft["items"][idx]
+            has_5_6, r5, r6 = has_two_backing_plate_models(curr_item["row_id"], catalog)
+            if has_5_6:
+                target_row = r6 if thick_val == "6" else r5
+                order_mode = draft.get("order_mode", get_user_order_mode(chat_id))
+                draft["items"][idx] = build_single_verified_item(
+                    target_row, curr_item["qty"], curr_item.get("with_shim", False), order_mode=order_mode
+                )
+            await query.edit_message_text(
+                format_single_item_edit_text(draft["items"][idx], idx, len(draft["items"]), has_5_6),
+                parse_mode="Markdown",
+                reply_markup=get_single_item_edit_keyboard(draft["items"][idx], idx, catalog),
+            )
+        return
+
+    # ۱۰. حذف یک لنت از لیست سفارش (item_del:IDX)
+    if data.startswith("item_del:"):
+        draft = PENDING_DRAFT_ORDERS.get(chat_id)
+        if not draft:
+            return
+        idx = int(data.split(":")[1])
+        if 0 <= idx < len(draft["items"]):
+            removed = draft["items"].pop(idx)
+            await query.answer(f"🗑 «{removed['base_name']}» حذف شد.")
+            await query.edit_message_text(
+                format_draft_order_summary(draft)
+                + "\n\n👇 **روی هر لنت کلیک کنید تا آن را ویرایش کنید، یا لنت جدید اضافه نمایید:**",
+                parse_mode="Markdown",
+                reply_markup=get_draft_edit_list_keyboard(draft),
+            )
+        return
+
+    # ۱۱. تبدیل فوری فاکتور <-> پیش‌فاکتور یا عمده <-> خرد روی PDF صادرشده
+    if data == "toggle_doctype":
         order_data = LAST_ORDERS.get(chat_id)
         if not order_data:
             await query.message.reply_text(
@@ -1965,8 +2514,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "فاکتور" if order_data["doc_type"] == "پیش‌فاکتور" else "پیش‌فاکتور"
         )
         await send_invoice_pdf(chat_id, order_data, context)
+        return
 
-    elif query.data == "toggle_ordermode":
+    if data == "toggle_ordermode":
         order_data = LAST_ORDERS.get(chat_id)
         if not order_data:
             await query.message.reply_text(
@@ -1979,6 +2529,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         USER_ORDER_MODES[chat_id] = new_mode
         apply_order_mode_pricing_to_items(order_data["items"], order_mode=new_mode)
         await send_invoice_pdf(chat_id, order_data, context)
+        return
 
 
 def start_health_server():
