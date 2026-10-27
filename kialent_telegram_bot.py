@@ -1392,7 +1392,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def start_health_server():
-    """وب‌سرور سبک برای آنلاین نگه داشتن ربات در سرویس‌های ابری رایگان (Koyeb / Render)"""
+    """وب‌سرور سبک + سیستم پینگ خودکار برای بیدار نگه داشتن ۲۴ ساعته ربات در Koyeb و Render"""
+    import time
     import threading
     from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -1409,6 +1410,12 @@ def start_health_server():
                 )
             )
 
+        def do_HEAD(self):
+            # پشتیبانی از درخواست HEAD برای مانیتورهای رایگان مثل UptimeRobot و Koyeb Health Check
+            self.send_response(200)
+            self.send_header("Content-type", "text/html; charset=utf-8")
+            self.end_headers()
+
         def log_message(self, format, *args):
             pass
 
@@ -1416,6 +1423,31 @@ def start_health_server():
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     print(f"🌐 وب‌سرور وضعیت روی پورت {port} راه‌اندازی شد.")
+
+    # پینگ خودکار به آدرس عمومی سرویس در Koyeb یا Render هر ۳ دقیقه برای جلوگیری از Sleep شدن
+    def keep_alive_pinger():
+        public_url = (
+            os.getenv("PUBLIC_URL")
+            or os.getenv("RENDER_EXTERNAL_URL")
+            or (
+                f"https://{os.getenv('KOYEB_PUBLIC_DOMAIN')}"
+                if os.getenv("KOYEB_PUBLIC_DOMAIN")
+                else None
+            )
+        )
+        if not public_url:
+            return
+        if not public_url.startswith("http"):
+            public_url = f"https://{public_url}"
+        print(f"🔄 سیستم بیدارباش خودکار (Keep-Alive) فعال شد: {public_url}")
+        while True:
+            time.sleep(180)  # هر ۳ دقیقه (۱۸۰ ثانیه)
+            try:
+                requests.get(public_url, timeout=10)
+            except Exception:
+                pass
+
+    threading.Thread(target=keep_alive_pinger, daemon=True).start()
 
 
 def main():
