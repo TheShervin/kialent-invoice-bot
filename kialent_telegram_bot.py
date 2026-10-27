@@ -276,6 +276,72 @@ FEMALE_INDICATORS = {
 }
 
 
+
+def normalize_automotive_stt_text(text: str) -> str:
+    """
+    اصلاح هوشمند اشتباهات رایج گفتار به نوشتار فارسی (STT) در حوزه لنت ترمز و لوازم یدکی:
+    - تبدیل «باشیم» / «با سیم» / «باسیم» به «با شیم»
+    - تبدیل «بدون سیم» / «بی سیم» / «بی‌سیم» به «بدون شیم»
+    - تبدیل «شیم دار» / «سیم دار» / «سیم‌دار» به «با شیم»
+    - استانداردسازی نام خودروها و ضخامت‌ها (۵ میل / ۶ میل)
+    """
+    if not text:
+        return ""
+    t = text.strip()
+
+    replacements = [
+        # اصلاح اشتباهات رایج کلمه «شیم» در ویس فارسی
+        (r"\bباشیم\b", "با شیم"),
+        (r"\bبا\s*سیم\b", "با شیم"),
+        (r"\bباسیم\b", "با شیم"),
+        (r"\bبا\s*شین\b", "با شیم"),
+        (r"\bباشین\b", "با شیم"),
+        (r"\bسیم\s*دار\b", "با شیم"),
+        (r"\bسیم‌دار\b", "با شیم"),
+        (r"\bشیم\s*دار\b", "با شیم"),
+        (r"\bشیم‌دار\b", "با شیم"),
+        (r"\bبدون\s*سیم\b", "بدون شیم"),
+        (r"\bبدون\s*شین\b", "بدون شیم"),
+        (r"\bبی\s*سیم\b", "بدون شیم"),
+        (r"\bبی‌سیم\b", "بدون شیم"),
+        (r"\bبی\s*شیم\b", "بدون شیم"),
+        (r"\bبی‌شیم\b", "بدون شیم"),
+        # اصلاح نام خودروها و ضخامت‌ها در گفتار
+        (r"\bپرایدی\b", "پراید"),
+        (r"\bتیبایی\b", "تیبا"),
+        (r"\bپژویی\b", "پژو"),
+        (r"\bسمندی\b", "سمند"),
+        (r"\bنیسانی\b", "نیسان"),
+        (r"\bپیکانی\b", "پیکان"),
+        (r"\bمزدایی\b", "مزدا"),
+        (r"\bام\s*وی\s*ام\b", "MVM"),
+        (r"\bایکس\s*۳۳\b", "X33"),
+        (r"\bایکس\s*33\b", "X33"),
+        (r"\bایکس\s*۲۲\b", "X22"),
+        (r"\bایکس\s*22\b", "X22"),
+        (r"\bایکس\s*۵۵\b", "X55"),
+        (r"\bایکس\s*55\b", "X55"),
+        (r"\bاس\s*۵\b", "S5"),
+        (r"\bاس\s*5\b", "S5"),
+        (r"\bاس\s*۳\b", "S3"),
+        (r"\bاس\s*3\b", "S3"),
+        (r"\bجی\s*۵\b", "J5"),
+        (r"\bجی\s*5\b", "J5"),
+        (r"\bجی\s*۴\b", "J4"),
+        (r"\bجی\s*4\b", "J4"),
+        (r"\bتی\s*۸\b", "T8"),
+        (r"\bتی\s*8\b", "T8"),
+        (r"\bشش\s*میل\b", "۶ میل"),
+        (r"\bشیش\s*میل\b", "۶ میل"),
+        (r"\bپنج\s*میل\b", "۵ میل"),
+    ]
+    for pattern, repl in replacements:
+        t = re.sub(pattern, repl, t)
+
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def format_person_with_honorific(name_str: str, gender: str = "") -> str:
     """
     افزودن «جناب آقای» برای آقایان و «سرکار خانم» برای خانم‌ها بدون اضافه کردن هیچ پسوند اضافی
@@ -436,9 +502,9 @@ def build_system_prompt(catalog: list) -> str:
 4. تاریخ (`date`): اگر کاربر تاریخ ذکر کرد آن را بنویسید، در غیر این صورت تاریخ امروز یعنی `"{today_str}"` را قرار دهید.
 5. تطبیق کالاها (`items`):
    - برای هر قلم سفارش، شماره ردیف دقیق (`row_id`) را از روی **نام قطعه خودرو** در لیست بالا پیدا کنید.
-   - اگر کالا دو ضخامت ۵ میل و ۶ میل دارد و کاربر ضخامت را ذکر کرد، ردیف مربوطه را انتخاب کنید (در صورت عدم ذکر ضخامت، پیش‌فرض ۵ میل است مگر در متن اشاره شده باشد).
-   - وضعیت شیم (`with_shim`): اگر کاربر عبارت «با شیم» یا «شیم‌دار» را به کار برد `true` و اگر گفت «بدون شیم» یا اشاره نکرد بررسی کنید (اگر برای کل سفارش گفت با شیم، برای همه اقلام `true` بگذارید؛ اگر نگفت `false` بگذارید).
-   - نام نمایشی کالا در جدول (`display_name`): اگر شیم‌دار است عبارت `با شیم` را در انتهای نام قطعه اضافه کنید.
+   - اگر کالا دو ضخامت ۵ میل و ۶ میل دارد (مثل تیبا/ریو ۷.۱ و ۷.۲، کوییک/ساینا، رانا و شاهین) و کاربر ضخامت را ذکر کرد (مثلاً «۶ میل» یا «۵ میل»)، حتماً ردیف دقیق همان ضخامت (مثلاً `7.2` برای تیبا/ریو ۶ میل) را انتخاب کنید.
+   - وضعیت شیم (`with_shim`): برای **هر قلم کالا به صورت جداگانه** بررسی کنید! اگر برای آن کالا عبارت «با شیم»، «باشیم»، «شیم‌دار» یا «با سیم» ذکر شده بود حتماً `with_shim` را `true` بگذارید؛ و اگر «بدون شیم»، «بدون سیم» یا «بی‌شیم» ذکر شده بود `false` بگذارید.
+   - نام نمایشی کالا در جدول (`display_name`): اگر `with_shim` برابر `true` است عبارت `با شیم` را در انتهای نام قطعه اضافه کنید (مگر اینکه کاربر صراحتاً بدون شیم خواسته باشد).
 6. خروجی شما باید **فقط و فقط یک JSON معتبر** بدون هیچ توضیح اضافه‌ای باشد با ساختار زیر:
 {{
   "doc_type": "پیش‌فاکتور" یا "فاکتور",
@@ -524,12 +590,13 @@ def call_openrouter_models(
 
 
 def extract_order_from_text(user_text: str, catalog: list) -> dict:
+    cleaned_text = normalize_automotive_stt_text(user_text)
     system_prompt = build_system_prompt(catalog)
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_text},
+        {"role": "user", "content": cleaned_text},
     ]
-    return call_openrouter_models(messages, FREE_TEXT_MODELS, catalog, source_text=user_text)
+    return call_openrouter_models(messages, FREE_TEXT_MODELS, catalog, source_text=cleaned_text)
 
 
 def extract_order_from_image(image_bytes: bytes, mime_type: str, caption: str, catalog: list) -> dict:
@@ -558,68 +625,107 @@ def extract_order_from_image(image_bytes: bytes, mime_type: str, caption: str, c
     return call_openrouter_models(messages, FREE_VISION_MODELS, catalog, source_text="")
 
 
-def transcribe_audio_fallback(audio_path: str) -> str:
+def transcribe_audio_high_accuracy(audio_path: str, audio_format: str = "ogg") -> str:
     """
-    تبدیل رایگان ویس فارسی به متن با استفاده از ffmpeg + SpeechRecognition (سرویس رایگان گوگل)
+    تبدیل دقیق ویس فارسی به متن با:
+    1. فیلتر حذف نویز و نرمال‌سازی بلندی صدا در ffmpeg (highpass + lowpass + dynaudnorm)
+    2. دریافت همزمان بهترین کاندیداها از موتور گفتار گوگل (show_all=True) و انتخاب جمله‌ای که بیشترین تطابق با اصطلاحات لنت را دارد
+    3. تصحیح خودکار اشتباهات آوایی رایج («باشیم» -> «با شیم»، «بدون سیم» -> «بدون شیم»، «پرایدی» -> «پراید» و...)
     """
     import speech_recognition as sr
 
+    raw_text = ""
     with tempfile.TemporaryDirectory() as tmpdir:
-        wav_path = os.path.join(tmpdir, "voice.wav")
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", wav_path],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        wav_path = os.path.join(tmpdir, "voice_clean.wav")
+        # اعمال فیلترهای صوتی برای شفافیت صدای گوینده و حذف نویز محیط
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-i", audio_path,
+            "-af", "highpass=f=80,lowpass=f=8000,dynaudnorm",
+            "-ar", "16000", "-ac", "1", wav_path
+        ]
+        res = subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode != 0:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", wav_path],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_path) as source:
             audio_data = recognizer.record(source)
-        return recognizer.recognize_google(audio_data, language="fa-IR")
 
+        try:
+            resp = recognizer.recognize_google(audio_data, language="fa-IR", show_all=True)
+            if isinstance(resp, dict) and "alternative" in resp and resp["alternative"]:
+                domain_terms = ["شیم", "لنت", "فاکتور", "میل", "جلو", "عقب", "دیسکی", "پراید", "پژو", "تیبا", "ریو"]
+                best_alt = resp["alternative"][0].get("transcript", "")
+                best_score = -1
+                for alt in resp["alternative"]:
+                    cand = alt.get("transcript", "")
+                    norm_cand = normalize_automotive_stt_text(cand)
+                    score = sum(2 for kw in domain_terms if kw in norm_cand)
+                    if score > best_score:
+                        best_score = score
+                        best_alt = norm_cand
+                raw_text = best_alt
+            elif isinstance(resp, str):
+                raw_text = resp
+        except Exception as e:
+            logger.warning(f"Google STT primary error: {e}")
+            try:
+                raw_text = recognizer.recognize_google(audio_data, language="fa-IR")
+            except Exception as e2:
+                logger.warning(f"Google STT simple fallback error: {e2}")
 
-def extract_order_from_voice(audio_path: str, audio_format: str, caption: str, catalog: list) -> tuple:
-    transcribed_text = None
+    # اگر سرویس گوگل در دسترس نبود، از مدل صوتی رایگان OpenRouter برای پیاده‌سازی متن استفاده می‌کنیم
+    if not raw_text:
+        try:
+            with open(audio_path, "rb") as f:
+                b64_audio = base64.b64encode(f.read()).decode("utf-8")
+            headers = {
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            for model_name in FREE_AUDIO_MODELS:
+                payload = {
+                    "model": model_name,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "لطفاً این ویس سفارش لنت ترمز را کلمه به کلمه و دقیق به متن فارسی تبدیل کن (اصطلاحات با شیم، بدون شیم، ۵ میل، ۶ میل و نام خودروها را دقیق بنویس). فقط متن پیاده‌شده را بدون هیچ توضیح اضافه‌ای برگردان.",
+                                },
+                                {
+                                    "type": "input_audio",
+                                    "input_audio": {"data": b64_audio, "format": audio_format},
+                                },
+                            ],
+                        }
+                    ],
+                    "temperature": 0.0,
+                }
+                r = requests.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=35,
+                )
+                if r.status_code == 200:
+                    txt = r.json()["choices"][0]["message"]["content"].strip()
+                    if txt:
+                        raw_text = txt
+                        break
+        except Exception as e:
+            logger.warning(f"OpenRouter audio transcription fallback error: {e}")
 
-    try:
-        transcribed_text = transcribe_audio_fallback(audio_path)
-        logger.info(f"Transcribed voice text: {transcribed_text}")
-    except Exception as e:
-        logger.warning(f"Local STT fallback warning: {e}")
+    if not raw_text:
+        raise RuntimeError("متأسفانه صدای واضحی از ویس دریافت نشد. لطفاً مجدداً ویس بفرستید یا سفارش را تایپ کنید.")
 
-    if transcribed_text:
-        full_text = transcribed_text
-        if caption:
-            full_text += f"\nتوضیحات تکمیلی: {caption}"
-        order_data = extract_order_from_text(full_text, catalog)
-        return order_data, transcribed_text
-
-    with open(audio_path, "rb") as f:
-        b64_audio = base64.b64encode(f.read()).decode("utf-8")
-
-    system_prompt = build_system_prompt(catalog)
-    user_prompt = "لطفاً به این پیام صوتی سفارش لنت ترمز گوش دهید و اطلاعات فاکتور/پیش‌فاکتور را دقیقاً به صورت JSON استخراج کنید."
-    if caption:
-        user_prompt += f"\nتوضیحات تکمیلی کاربر: {caption}"
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": user_prompt},
-                {
-                    "type": "input_audio",
-                    "input_audio": {
-                        "data": b64_audio,
-                        "format": audio_format,
-                    },
-                },
-            ],
-        },
-    ]
-    order_data = call_openrouter_models(messages, FREE_AUDIO_MODELS, catalog, source_text=caption)
-    return order_data, "استخراج مستقیم از فایل صوتی"
+    return normalize_automotive_stt_text(raw_text)
 
 
 def validate_and_price_order(parsed: dict, catalog: list, source_text: str = "") -> dict:
@@ -1193,6 +1299,8 @@ def generate_pdf_bytes(order_data: dict) -> bytes:
 # ۸. هندلرهای ربات تلگرام (متن، ویس، عکس و فایل اکسل)
 # ==============================================================================
 LAST_ORDERS = {}
+PENDING_VOICE_TEXTS = {}
+AWAITING_VOICE_EDIT = set()
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1279,10 +1387,16 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     chat_id = update.effective_chat.id
 
+    # اگر کاربر در حالت ویرایش متن ویس بود، متن جدیدش را به عنوان متن اصلاح‌شده ویس پردازش می‌کنیم
+    was_editing_voice = chat_id in AWAITING_VOICE_EDIT
+    AWAITING_VOICE_EDIT.discard(chat_id)
+    PENDING_VOICE_TEXTS.pop(chat_id, None)
+
+    cleaned_text = normalize_automotive_stt_text(user_text)
     wait_msg = await update.message.reply_text("⏳ در حال بررسی لیست قیمت و صدور فاکتور ۲ صفحه‌ای...")
     try:
         catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
-        order_data = extract_order_from_text(user_text, catalog)
+        order_data = extract_order_from_text(cleaned_text, catalog)
 
         if not order_data["items"]:
             warn_txt = "\n".join(order_data.get("warnings", []))
@@ -1292,7 +1406,8 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         LAST_ORDERS[chat_id] = order_data
-        await send_invoice_pdf(chat_id, order_data, context)
+        extra_note = cleaned_text if was_editing_voice else None
+        await send_invoice_pdf(chat_id, order_data, context, extra_note=extra_note)
         await wait_msg.delete()
 
     except Exception as e:
@@ -1301,13 +1416,16 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_voice_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    دریافت ویس، تبدیل به متن با دقت بالا + اصلاح اصطلاحات لنت («باشیم» -> «با شیم» و...)
+    و نمایش متن به کاربر برای تایید قبل از ارسال به هوش مصنوعی و صدور فاکتور
+    """
     chat_id = update.effective_chat.id
     voice = update.message.voice or update.message.audio
     caption = update.message.caption or ""
 
-    wait_msg = await update.message.reply_text("🎙 در حال گوش دادن به ویس و استخراج اقلام فاکتور...")
+    wait_msg = await update.message.reply_text("🎙 در حال گوش دادن به ویس و تبدیل به متن...")
     try:
-        catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
         tg_file = await context.bot.get_file(voice.file_id)
 
         ext = "ogg"
@@ -1322,19 +1440,43 @@ async def handle_voice_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
         with tempfile.TemporaryDirectory() as tmpdir:
             audio_path = os.path.join(tmpdir, f"order_voice.{ext}")
             await tg_file.download_to_drive(audio_path)
-            order_data, transcribed = extract_order_from_voice(audio_path, ext, caption, catalog)
+            transcribed = transcribe_audio_high_accuracy(audio_path, ext)
 
-        if not order_data["items"]:
-            warn_txt = "\n".join(order_data.get("warnings", []))
-            await wait_msg.edit_text(
-                f"⚠️ هیچ کالای قیمت‌داری از ویس شما استخراج نشد.\nمتن تشخیص داده شده: `{transcribed}`\n{warn_txt}",
-                parse_mode="Markdown",
-            )
-            return
+        if caption:
+            transcribed = f"{transcribed}\n{normalize_automotive_stt_text(caption)}"
 
-        LAST_ORDERS[chat_id] = order_data
-        await send_invoice_pdf(chat_id, order_data, context, extra_note=transcribed)
-        await wait_msg.delete()
+        PENDING_VOICE_TEXTS[chat_id] = transcribed
+        AWAITING_VOICE_EDIT.discard(chat_id)
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ بله، مورد تایید است (صدور فاکتور)", callback_data="confirm_voice_order"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "✏️ ویرایش متن", callback_data="edit_voice_order"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ لغو", callback_data="cancel_voice_order"
+                    ),
+                ],
+            ]
+        )
+
+        confirm_msg = (
+            "🎙 **متن تشخیص داده شده از ویس شما:**\n\n"
+            f"`{transcribed}`\n\n"
+            "❓ **آیا این متن مورد تایید است؟**\n"
+            "_(اگر قسمتی نیاز به تغییر دارد، می‌توانید متن بالا را با ضربه زدن کپی، اصلاح و ارسال کنید یا دکمه زیر را بزنید)_"
+        )
+        await wait_msg.edit_text(
+            confirm_msg,
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
 
     except Exception as e:
         logger.exception("Error processing voice order")
@@ -1377,7 +1519,55 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     chat_id = query.message.chat_id
 
-    if query.data == "toggle_doctype":
+    if query.data == "confirm_voice_order":
+        transcribed = PENDING_VOICE_TEXTS.pop(chat_id, None)
+        AWAITING_VOICE_EDIT.discard(chat_id)
+        if not transcribed:
+            await query.edit_message_text(
+                "⚠️ متن این ویس در حافظه موقت یافت نشد. لطفاً مجدداً ویس یا متن سفارش را بفرستید."
+            )
+            return
+
+        await query.edit_message_text(
+            f"✅ **متن تایید شد:**\n`{transcribed}`\n\n⏳ در حال ارسال به هوش مصنوعی و صدور فاکتور ۲ صفحه‌ای...",
+            parse_mode="Markdown",
+        )
+        try:
+            catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
+            order_data = extract_order_from_text(transcribed, catalog)
+            if not order_data["items"]:
+                warn_txt = "\n".join(order_data.get("warnings", []))
+                await query.edit_message_text(
+                    f"⚠️ هیچ کالای قیمت‌داری از این متن استخراج نشد.\nمتن: `{transcribed}`\n{warn_txt}",
+                    parse_mode="Markdown",
+                )
+                return
+
+            LAST_ORDERS[chat_id] = order_data
+            await send_invoice_pdf(chat_id, order_data, context, extra_note=transcribed)
+            await query.message.delete()
+        except Exception as e:
+            logger.exception("Error issuing invoice from confirmed voice")
+            await query.edit_message_text(
+                f"❌ خطا در صدور فاکتور:\n`{e}`", parse_mode="Markdown"
+            )
+
+    elif query.data == "edit_voice_order":
+        transcribed = PENDING_VOICE_TEXTS.get(chat_id, "")
+        AWAITING_VOICE_EDIT.add(chat_id)
+        await query.edit_message_text(
+            "✏️ **حالت ویرایش متن ویس:**\n\n"
+            "روی متن زیر بزنید تا کپی شود، سپس بخش مورد نظر را اصلاح کرده و در همین چت ارسال کنید:\n\n"
+            f"`{transcribed}`",
+            parse_mode="Markdown",
+        )
+
+    elif query.data == "cancel_voice_order":
+        PENDING_VOICE_TEXTS.pop(chat_id, None)
+        AWAITING_VOICE_EDIT.discard(chat_id)
+        await query.edit_message_text("❌ سفارش صوتی لغو شد. می‌توانید مجدداً ویس یا پیام متنی بفرستید.")
+
+    elif query.data == "toggle_doctype":
         order_data = LAST_ORDERS.get(chat_id)
         if not order_data:
             await query.message.reply_text(
