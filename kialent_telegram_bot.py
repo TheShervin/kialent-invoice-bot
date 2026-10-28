@@ -471,6 +471,46 @@ def calculate_final_unit_price(base_price: int, row_id: str, part_name: str, ord
         return int(round(base_price * 1.10)), 10
 
 
+def get_volume_discount_percent(total_qty: int) -> int:
+    """
+    محاسبه درصد تخفیف پلکانی بر اساس مجموع تعداد (دست) در سفارش:
+    - سفارش‌های بیش از ۵۰ دست (از ۵۰ دست به بالا): ۳٪ تخفیف
+    - سفارش‌های بیش از ۱۰۰ دست (از ۱۰۰ دست به بالا): ۵٪ تخفیف
+    - سفارش‌های بیش از ۲۰۰ دست (از ۲۰۰ دست به بالا): ۹٪ تخفیف
+    """
+    q = int(total_qty or 0)
+    if q >= 200:
+        return 9
+    elif q >= 100:
+        return 5
+    elif q >= 50:
+        return 3
+    return 0
+
+
+def calculate_order_financials(items: list) -> dict:
+    """
+    محاسبه دقیق مبالغ سفارش شامل:
+    - جمع کل تعداد (total_qty)
+    - جمع کل قبل از تخفیف (subtotal)
+    - درصد تخفیف حجمی (discount_percent: 0, 3, 5, 9)
+    - مبلغ تخفیف به ریال (discount_amount)
+    - مبلغ نهایی قابل پرداخت پس از کسر تخفیف (total_payable)
+    """
+    total_qty = sum(int(it.get("qty", 0)) for it in items)
+    subtotal = sum(int(it.get("qty", 0)) * int(it.get("unit_price", 0)) for it in items)
+    discount_pct = get_volume_discount_percent(total_qty)
+    discount_amount = int(round(subtotal * (discount_pct / 100.0))) if discount_pct > 0 else 0
+    total_payable = max(0, subtotal - discount_amount)
+    return {
+        "total_qty": total_qty,
+        "subtotal": subtotal,
+        "discount_percent": discount_pct,
+        "discount_amount": discount_amount,
+        "total_payable": total_payable,
+    }
+
+
 # ==============================================================================
 # ۴. توابع کمکی: تاریخ شمسی، اعداد فارسی، تبدیل عدد به حروف و نرمال‌سازی عنوان مشتری
 # ==============================================================================
@@ -1169,6 +1209,10 @@ def answer_catalog_question(user_question: str, catalog: list, order_mode: str =
 
 === قوانین و شرایط فروش شرکت ===
 - حداقل خرید عمده: ۲ کارتن یا معادل ۲۰ دست لنت می‌باشد (سفارش‌های کمتر از ۱۵ دست، سفارش عمده محسوب نمی‌شوند و به سفارش خرد منتقل می‌شوند).
+- تخفیف‌های پلکانی خرید حجمی:
+  • سفارش‌های بیش از ۵۰ دست: ۳٪ تخفیف روی کل فاکتور
+  • سفارش‌های بیش از ۱۰۰ دست: ۵٪ تخفیف روی کل فاکتور
+  • سفارش‌های بیش از ۲۰۰ دست: ۹٪ تخفیف روی کل فاکتور
 - نحوه تسویه: تمامی سفارشات به صورت نقدی تسویه می‌شوند.
 - قیمت‌های سفارش عمده تا قبل از ثبت سفارش و صدور پیش‌فاکتور رسمی نمایش داده نمی‌شود؛ اگر مشتری در حالت عمده قیمت تک‌تک لنت‌ها را پرسید، محترمانه بگویید که کافی است لیست سفارش خود را بفرستد تا پیش‌فاکتور رسمی با قیمت روز برایش صادر شود.
 - اگر مشتری پرسید «چه لنت‌هایی دارید؟»، دسته‌بندی کامل لنت‌های تولیدی ما (ایرانی، چینی، شاسی‌بلند و وارداتی) را به صورت مرتب و خوانا معرفی کنید.
@@ -1667,10 +1711,29 @@ def render_invoice_html(
     invoice_no: str = ".........................",
     attachment: str = "دارد",
 ) -> str:
-    total_payable = sum(item["qty"] * item["unit_price"] for item in items)
-    total_qty = sum(item["qty"] for item in items)
+    fin = calculate_order_financials(items)
+    total_qty = fin["total_qty"]
+    subtotal = fin["subtotal"]
+    discount_pct = fin["discount_percent"]
+    discount_amount = fin["discount_amount"]
+    total_payable = fin["total_payable"]
     carton_stats = calculate_order_cartons(items)
     total_words = num_to_persian_words(total_payable) + " ریال"
+
+    discount_rows_html = ""
+    payable_label = "مبلغ قابل پرداخت"
+    if discount_pct > 0:
+        payable_label = "مبلغ قابل پرداخت (پس از کسر تخفیف)"
+        discount_rows_html = f"""
+                <tr>
+                    <td class="sum-label">جمع کل قبل از تخفیف</td>
+                    <td class="sum-amount">{to_fa_num(subtotal, comma=True)}</td>
+                </tr>
+                <tr style="background-color: #e8f5e9; color: #1b5e20;">
+                    <td class="sum-label">تخفیف حجمی خرید ({to_fa_num(discount_pct)}٪)</td>
+                    <td class="sum-amount" dir="ltr">-{to_fa_num(discount_amount, comma=True)}</td>
+                </tr>
+        """
 
     # ردیف‌های صفحه اول (جدول فاکتور / پیش‌فاکتور)
     rows_html = ""
@@ -2061,8 +2124,9 @@ body {{
                     <td class="sum-label">جمع کل تعداد (بر اساس جعبه کیا)</td>
                     <td class="sum-amount">{to_fa_num(total_qty)} دست ({carton_stats['summary_short']})</td>
                 </tr>
+                {discount_rows_html}
                 <tr>
-                    <td class="sum-label">مبلغ قابل پرداخت</td>
+                    <td class="sum-label">{payable_label}</td>
                     <td class="sum-amount">{to_fa_num(total_payable, comma=True)}</td>
                 </tr>
                 <tr>
@@ -2336,8 +2400,12 @@ def format_draft_order_summary(order_data: dict, is_vip: bool = False) -> str:
         f"📦 **لنت‌های تشخیص داده شده ({to_fa_num(len(items))} ردیف):**",
     ]
 
-    total_payable = sum(it["qty"] * it["unit_price"] for it in items)
-    total_qty = sum(it["qty"] for it in items)
+    fin = calculate_order_financials(items)
+    total_qty = fin["total_qty"]
+    subtotal = fin["subtotal"]
+    discount_pct = fin["discount_percent"]
+    discount_amount = fin["discount_amount"]
+    total_payable = fin["total_payable"]
     carton_stats = calculate_order_cartons(items)
     compact_mode = len(items) > 18
 
@@ -2345,9 +2413,18 @@ def format_draft_order_summary(order_data: dict, is_vip: bool = False) -> str:
     footer_lines.append(f"📊 **جمع کل تعداد:** `{to_fa_num(total_qty)} دست` ({to_fa_num(len(items))} ردیف کالا)")
     footer_lines.append(f"📦 **محاسبه تعداد کارتن کیا:** `{carton_stats['summary_full']}`")
     if hide_prices:
+        if discount_pct > 0:
+            footer_lines.append(
+                f"🎁 **تخفیف حجمی شامل این سفارش:** `{to_fa_num(discount_pct)}٪ تخفیف ویژه` (در پیش‌فاکتور کسر می‌گردد)"
+            )
         footer_lines.append("💡 _قیمت‌های سفارش عمده پس از تایید اقلام، در فایل «پیش‌فاکتور» درج و نمایش داده می‌شود._")
     else:
-        footer_lines.append(f"💰 **مبلغ کل قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`")
+        if discount_pct > 0:
+            footer_lines.append(f"💵 **جمع کل قبل از تخفیف:** `{to_fa_num(subtotal, comma=True)} ریال`")
+            footer_lines.append(f"🎁 **تخفیف حجمی ({to_fa_num(discount_pct)}٪):** `{to_fa_num(discount_amount, comma=True)} ریال`")
+            footer_lines.append(f"💰 **مبلغ کل قابل پرداخت (با تخفیف):** `{to_fa_num(total_payable, comma=True)} ریال`")
+        else:
+            footer_lines.append(f"💰 **مبلغ کل قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`")
 
     warnings = order_data.get("warnings") or []
     if warnings:
@@ -2885,10 +2962,22 @@ async def send_vip_direct_invoice_pdf(
     cust = order_data["customer_title"]
     filename = f"{doc_type} سفارش {cust}.pdf"
 
-    total_payable = sum(i["qty"] * i["unit_price"] for i in order_data["items"])
-    total_qty = sum(i["qty"] for i in order_data["items"])
+    fin = calculate_order_financials(order_data["items"])
+    total_qty = fin["total_qty"]
+    subtotal = fin["subtotal"]
+    discount_pct = fin["discount_percent"]
+    discount_amount = fin["discount_amount"]
+    total_payable = fin["total_payable"]
     carton_stats = calculate_order_cartons(order_data["items"])
     mode_label = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
+
+    price_lines = (
+        f"💵 جمع قبل از تخفیف: `{to_fa_num(subtotal, comma=True)} ریال`\n"
+        f"🎁 تخفیف حجمی ({to_fa_num(discount_pct)}٪): `{to_fa_num(discount_amount, comma=True)} ریال`\n"
+        f"💰 مبلغ قابل پرداخت: `{to_fa_num(total_payable, comma=True)} ریال`\n"
+        if discount_pct > 0
+        else f"💰 مبلغ قابل پرداخت: `{to_fa_num(total_payable, comma=True)} ریال`\n"
+    )
 
     caption = (
         f"📄 **{doc_type} سفارش {cust}** (صدور مستقیم VIP)\n"
@@ -2896,7 +2985,7 @@ async def send_vip_direct_invoice_pdf(
         f"📅 تاریخ: `{to_fa_num(order_data['date'])}`\n"
         f"📦 تعداد کل: `{to_fa_num(total_qty)}` دست ({to_fa_num(len(order_data['items']))} ردیف)\n"
         f"📦 معادل کارتن کیا: `{carton_stats['summary_full']}`\n"
-        f"💰 مبلغ قابل پرداخت: `{to_fa_num(total_payable, comma=True)} ریال`\n"
+        f"{price_lines}"
         f"📎 پیوست صفحه ۲: `جدول راهنمای کاربرد و اشتراکات لنت‌ها`"
     )
     if extra_note:
@@ -3010,8 +3099,12 @@ async def send_customer_proforma_pdf(
     cust = order_data["customer_title"]
     filename = f"پیش‌فاکتور سفارش {cust}.pdf"
 
-    total_payable = sum(i["qty"] * i["unit_price"] for i in order_data["items"])
-    total_qty = sum(i["qty"] for i in order_data["items"])
+    fin = calculate_order_financials(order_data["items"])
+    total_qty = fin["total_qty"]
+    subtotal = fin["subtotal"]
+    discount_pct = fin["discount_percent"]
+    discount_amount = fin["discount_amount"]
+    total_payable = fin["total_payable"]
     carton_stats = calculate_order_cartons(order_data["items"])
     mode_label = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
 
@@ -3024,6 +3117,14 @@ async def send_customer_proforma_pdf(
     }
     USER_ACTIVE_ORDER_ID[chat_id] = oid
 
+    price_lines = (
+        f"💵 جمع قبل از تخفیف: `{to_fa_num(subtotal, comma=True)} ریال`\n"
+        f"🎁 تخفیف حجمی ({to_fa_num(discount_pct)}٪): `{to_fa_num(discount_amount, comma=True)} ریال`\n"
+        f"💰 مبلغ قابل پرداخت: `{to_fa_num(total_payable, comma=True)} ریال`\n"
+        if discount_pct > 0
+        else f"💰 مبلغ قابل پرداخت: `{to_fa_num(total_payable, comma=True)} ریال`\n"
+    )
+
     caption = ""
     if auto_switched_notice:
         caption += f"{auto_switched_notice}\n\n"
@@ -3035,7 +3136,7 @@ async def send_customer_proforma_pdf(
         f"📅 تاریخ: `{to_fa_num(order_data['date'])}`\n"
         f"📦 تعداد کل: `{to_fa_num(total_qty)}` دست ({to_fa_num(len(order_data['items']))} ردیف)\n"
         f"📦 معادل کارتن کیا: `{carton_stats['summary_full']}`\n"
-        f"💰 مبلغ قابل پرداخت: `{to_fa_num(total_payable, comma=True)} ریال`\n"
+        f"{price_lines}"
         f"📎 پیوست صفحه ۲: `جدول راهنمای کاربرد و اشتراکات لنت‌ها`\n\n"
         "📌 **مراحل نهایی‌سازی سفارش و دریافت فاکتور رسمی:**\n"
         "۱. در صورت مورد تایید بودن پیش‌فاکتور بالا، دکمه **«✅ تایید پیش‌فاکتور و ارسال برای مدیریت جهت پرداخت»** را بزنید.\n"
@@ -3087,8 +3188,9 @@ async def forward_receipt_to_admin(
     oid = ord_rec["order_id"]
     order_data = ord_rec["order_data"]
     cust = order_data["customer_title"]
-    total_payable = sum(i["qty"] * i["unit_price"] for i in order_data["items"])
-    total_qty = sum(i["qty"] for i in order_data["items"])
+    fin = calculate_order_financials(order_data["items"])
+    total_payable = fin["total_payable"]
+    total_qty = fin["total_qty"]
     user = update.effective_user
     user_tag = f"@{user.username}" if (user and user.username) else f"ID: {user.id if user else ord_rec['customer_chat_id']}"
     full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() if user else ""
@@ -3183,7 +3285,7 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cust_chat_id = ord_rec["customer_chat_id"]
             ord_rec["status"] = "awaiting_receipt"
             USER_ACTIVE_ORDER_ID[cust_chat_id] = oid
-            total_payable = sum(i["qty"] * i["unit_price"] for i in ord_rec["order_data"]["items"])
+            total_payable = calculate_order_financials(ord_rec["order_data"]["items"])["total_payable"]
 
             await context.bot.send_message(
                 chat_id=cust_chat_id,
@@ -4012,7 +4114,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ord_rec["status"] = "awaiting_receipt"
         cust_chat_id = ord_rec["customer_chat_id"]
         USER_ACTIVE_ORDER_ID[cust_chat_id] = oid
-        total_payable = sum(i["qty"] * i["unit_price"] for i in ord_rec["order_data"]["items"])
+        total_payable = calculate_order_financials(ord_rec["order_data"]["items"])["total_payable"]
 
         await context.bot.send_message(
             chat_id=cust_chat_id,
