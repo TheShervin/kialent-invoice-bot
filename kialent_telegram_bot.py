@@ -37,6 +37,10 @@ from telegram.ext import (
 # ==============================================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "YOUR_OPENROUTER_API_KEY_HERE")
+# کلید رایگان Google AI Studio (دریافت از https://aistudio.google.com/apikey)
+# می‌توانید در Koyeb متغیر GEMINI_API_KEY را ست کنید یا در تلگرام دستور /setgemini را بفرستید
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+RUNTIME_GEMINI_API_KEY = GEMINI_API_KEY.strip()
 
 # مشخصات مدیر (مهندس شروین اکبری) جهت دریافت پیش‌فاکتورها، رسیدهای پرداخت و تایید نهایی فاکتور
 ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "84838606"))
@@ -54,33 +58,48 @@ PAYMENT_BANK_INFO = os.getenv(
 # مسیر فایل اکسل لیست قیمت (می‌توانید فایل اکسل جدید را مستقیم در تلگرام هم برای ربات بفرستید)
 EXCEL_FILE_PATH = os.getenv("EXCEL_FILE_PATH", "New Microsoft Excel Worksheet.xlsx")
 
-# لیست مدل‌های رایگان متنی OpenRouter (ابتدا روتر هوشمند رایگان و سپس مدل‌های رایگان جایگزین)
-FREE_TEXT_MODELS = [
-    "google/gemini-2.0-flash-exp:free",
-    "deepseek/deepseek-chat-v3-0324:free",
-    "qwen/qwen-2.5-72b-instruct:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "google/gemma-4-31b-it:free",
-    "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "nvidia/nemotron-3-super-120b-a12b:free",
-    "google/gemma-4-26b-a4b-it:free",
+# لیست مدل‌های رایگان فعال در OpenRouter (حذف مدل‌های قدیمی 404 و اولویت با روتر هوشمند رایگان و مدل‌های فعال)
+FREE_TEXT_MODELS_PRIMARY = [
     "openrouter/free",
+    "google/gemma-4-31b-it:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
 ]
 
-# لیست مدل‌های رایگان بینایی (Vision) برای خواندن عکس سفارش
+FREE_TEXT_MODELS_SECONDARY = [
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "deepseek/deepseek-r1:free",
+    "qwen/qwen3-235b-a22b:free",
+    "meta-llama/llama-4-maverick:free",
+    "meta-llama/llama-4-scout:free",
+    "openrouter/free",
+    "google/gemma-4-31b-it:free",
+]
+
+FREE_TEXT_MODELS = FREE_TEXT_MODELS_PRIMARY + FREE_TEXT_MODELS_SECONDARY
+
+# لیست مدل‌های رایگان Google AI Studio (Gemini API مستقیم)
+GEMINI_STUDIO_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+]
+
+# لیست مدل‌های رایگان بینایی (Vision) برای خواندن عکس سفارش در OpenRouter
 FREE_VISION_MODELS = [
     "openrouter/free",
     "google/gemma-4-31b-it:free",
     "google/gemma-4-26b-a4b-it:free",
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-    "google/gemini-2.0-flash-exp:free",
-    "qwen/qwen-2.5-vl-72b-instruct:free",
+    "meta-llama/llama-4-maverick:free",
+    "meta-llama/llama-4-scout:free",
 ]
 
 # لیست مدل‌های رایگان صوتی (Audio) برای درک مستقیم ویس در OpenRouter
 FREE_AUDIO_MODELS = [
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-    "google/gemini-2.0-flash-exp:free",
     "openrouter/free",
 ]
 
@@ -613,49 +632,193 @@ def parse_json_from_llm(content: str) -> dict:
     return json.loads(content)
 
 
-def call_openrouter_models(
-    messages: list, models_list: list, catalog: list, source_text: str = "", order_mode: str = "wholesale"
-) -> dict:
+def _has_valid_gemini_key() -> bool:
+    k = (RUNTIME_GEMINI_API_KEY or "").strip()
+    return bool(k and k not in ("YOUR_GEMINI_API_KEY_HERE", "NONE", "null"))
+
+
+def _has_valid_openrouter_key() -> bool:
+    k = (OPENROUTER_API_KEY or "").strip()
+    return bool(k and k not in ("YOUR_OPENROUTER_API_KEY_HERE", "NONE", "null"))
+
+
+def _convert_messages_to_gemini_payload(messages: list, temperature: float = 0.0, json_mode: bool = False) -> dict:
+    """تبدیل فرمت پیام‌های استاندارد (شامل متن، عکس و ویس) به فرمت رسمی Google AI Studio (Gemini API)"""
+    system_texts = []
+    contents = []
+
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+
+        if role == "system":
+            if isinstance(content, str):
+                system_texts.append(content)
+            continue
+
+        parts = []
+        if isinstance(content, str):
+            parts.append({"text": content})
+        elif isinstance(content, list):
+            for item in content:
+                itype = item.get("type")
+                if itype == "text":
+                    parts.append({"text": item.get("text", "")})
+                elif itype == "image_url":
+                    url = item.get("image_url", {}).get("url", "")
+                    if url.startswith("data:") and ";base64," in url:
+                        header, b64_data = url.split(";base64,", 1)
+                        mime_type = header.replace("data:", "").strip() or "image/jpeg"
+                        parts.append({"inline_data": {"mime_type": mime_type, "data": b64_data}})
+                elif itype == "input_audio":
+                    aud = item.get("input_audio", {})
+                    b64_data = aud.get("data", "")
+                    fmt = aud.get("format", "ogg").lower()
+                    mime_map = {
+                        "ogg": "audio/ogg",
+                        "mp3": "audio/mp3",
+                        "wav": "audio/wav",
+                        "m4a": "audio/mp4",
+                    }
+                    parts.append({"inline_data": {"mime_type": mime_map.get(fmt, "audio/ogg"), "data": b64_data}})
+
+        if parts:
+            gemini_role = "model" if role == "assistant" else "user"
+            contents.append({"role": gemini_role, "parts": parts})
+
+    payload = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": temperature,
+        },
+    }
+    if json_mode:
+        payload["generationConfig"]["responseMimeType"] = "application/json"
+    if system_texts:
+        payload["systemInstruction"] = {
+            "parts": [{"text": "\n\n".join(system_texts)}]
+        }
+    return payload
+
+
+def _call_google_ai_studio_single(messages: list, model_name: str, temperature: float = 0.0, json_mode: bool = False) -> str:
+    """فراخوانی مستقیم یک مدل رایگان در Google AI Studio"""
+    if not _has_valid_gemini_key():
+        raise RuntimeError("کلید GEMINI_API_KEY تنظیم نشده است.")
+
+    keys = [k.strip() for k in RUNTIME_GEMINI_API_KEY.split(",") if k.strip()]
+    last_err = None
+    for api_key in keys:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        payload = _convert_messages_to_gemini_payload(messages, temperature=temperature, json_mode=json_mode)
+        resp = requests.post(url, json=payload, timeout=40)
+        if resp.status_code != 200:
+            # اگر مدل خاصی responseMimeType را پشتیبانی نکرد، بدون json_mode امتحان می‌کنیم
+            if resp.status_code == 400 and json_mode:
+                payload_no_mime = _convert_messages_to_gemini_payload(messages, temperature=temperature, json_mode=False)
+                resp = requests.post(url, json=payload_no_mime, timeout=40)
+            if resp.status_code != 200:
+                logger.warning(f"Google AI Studio model {model_name} returned {resp.status_code}: {resp.text[:250]}")
+                last_err = f"Gemini HTTP {resp.status_code}"
+                continue
+
+        data = resp.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            last_err = "Empty candidates from Gemini"
+            continue
+        parts = candidates[0].get("content", {}).get("parts") or []
+        text_out = "".join(p.get("text", "") for p in parts).strip()
+        if text_out:
+            logger.info(f"✅ پاسخ با موفقیت از Google AI Studio ({model_name}) دریافت شد.")
+            return text_out
+    raise RuntimeError(last_err or "خطا در Google AI Studio")
+
+
+def _call_openrouter_single(messages: list, model_name: str, temperature: float = 0.0) -> str:
+    """فراخوانی یک مدل رایگان در OpenRouter"""
+    if not _has_valid_openrouter_key():
+        raise RuntimeError("کلید OPENROUTER_API_KEY تنظیم نشده است.")
+
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://t.me/KialentInvoiceBot",
         "X-Title": "Kialent Alborz Noor Invoice Bot",
     }
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    resp = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=40,
+    )
+    if resp.status_code != 200:
+        logger.warning(f"OpenRouter Model {model_name} returned {resp.status_code}: {resp.text[:250]}")
+        raise RuntimeError(f"OpenRouter HTTP {resp.status_code}")
+
+    data = resp.json()
+    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+    if not content or not content.strip():
+        raise RuntimeError(f"Empty response from OpenRouter {model_name}")
+    logger.info(f"✅ پاسخ با موفقیت از OpenRouter ({model_name}) دریافت شد.")
+    return content.strip()
+
+
+def call_openrouter_models(
+    messages: list, models_list: list, catalog: list, source_text: str = "", order_mode: str = "wholesale"
+) -> dict:
+    """
+    سیستم چرخشی و جایگزینی دوطرفه (Mutual Fallback) بین OpenRouter و Google AI Studio:
+    ۱. ابتدا مدل‌های اصلی رایگان OpenRouter را امتحان می‌کند.
+    ۲. اگر OpenRouter شلوغ یا محدود (429/404) بود، بلافاصله سراغ مدل‌های رایگان Google AI Studio می‌رود.
+    ۳. اگر Google AI Studio هم شلوغ بود، دوباره با مدل‌های جایگزین به سراغ OpenRouter برمی‌گردد.
+    ۴. در نهایت در صورت نیاز یک دور نهایی دیگر Google AI Studio و OpenRouter را بررسی می‌کند.
+    """
+    import time
 
     last_error = None
-    for model_name in models_list:
-        try:
-            payload = {
-                "model": model_name,
-                "messages": messages,
-                "temperature": 0.0,
-            }
-            resp = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=45,
-            )
-            if resp.status_code != 200:
-                logger.warning(f"Model {model_name} returned {resp.status_code}: {resp.text[:250]}")
-                last_error = f"HTTP {resp.status_code}"
-                continue
+    primary_or_models = models_list[:4] if len(models_list) > 4 else models_list
+    secondary_or_models = models_list[4:] if len(models_list) > 4 else ["openrouter/free", "google/gemma-4-31b-it:free"]
 
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"]
-            if not content:
-                continue
+    # ساخت مراحل چرخشی: OpenRouter (موج ۱) -> Google AI Studio (موج ۱) -> OpenRouter (موج ۲) -> Google AI Studio (موج ۲)
+    waves = [
+        ("openrouter", primary_or_models, 0.0),
+        ("gemini", GEMINI_STUDIO_MODELS[:3], 0.0),
+        ("openrouter", secondary_or_models, 1.2),
+        ("gemini", GEMINI_STUDIO_MODELS[3:] + ["gemini-2.0-flash", "gemini-2.5-flash"], 1.2),
+        ("openrouter", ["openrouter/free", "google/gemma-4-31b-it:free", "google/gemma-4-26b-a4b-it:free"], 1.5),
+    ]
 
-            parsed = parse_json_from_llm(content)
-            return validate_and_price_order(parsed, catalog, source_text=source_text, order_mode=order_mode)
-
-        except Exception as e:
-            logger.warning(f"Error with model {model_name}: {e}")
-            last_error = str(e)
+    for provider, wave_models, delay_sec in waves:
+        if provider == "gemini" and not _has_valid_gemini_key():
             continue
+        if provider == "openrouter" and not _has_valid_openrouter_key():
+            continue
+        if delay_sec > 0:
+            time.sleep(delay_sec)
 
-    raise RuntimeError(f"خطا در دریافت پاسخ از مدل‌های رایگان OpenRouter: {last_error}")
+        for model_name in wave_models:
+            try:
+                if provider == "openrouter":
+                    content = _call_openrouter_single(messages, model_name, temperature=0.0)
+                else:
+                    content = _call_google_ai_studio_single(messages, model_name, temperature=0.0, json_mode=True)
+
+                parsed = parse_json_from_llm(content)
+                return validate_and_price_order(parsed, catalog, source_text=source_text, order_mode=order_mode)
+            except Exception as e:
+                logger.warning(f"[{provider.upper()}] Error with {model_name}: {e}")
+                last_error = str(e)
+                continue
+
+    raise RuntimeError(
+        f"خطا در دریافت پاسخ از سرویس‌های هوش مصنوعی (OpenRouter / Google AI Studio): {last_error}"
+    )
 
 
 
@@ -718,44 +881,41 @@ def answer_catalog_question(user_question: str, catalog: list, order_mode: str =
 - اگر مشتری پرسید «لنت فلان ماشین به چه ماشین‌هایی می‌خورد؟» یا «برای فلان ماشین چه لنتی دارید و با چی مشترکه؟»، دقیقاً از ستون «خودروهای سازگار و مشترک (اشتراکات)» در جدول بالا استفاده کنید و کد فنی و تمام خودروهای مشترک آن را کامل بنویسید.
 - پاسخ را با فرمت زیبا، بولت‌بندی شده و اعداد فارسی بنویسید."""
 
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://t.me/KialentInvoiceBot",
-        "X-Title": "Kialent Alborz Noor Technical QA",
-    }
-
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_question},
     ]
 
+    import time
     last_error = None
-    for model_name in FREE_TEXT_MODELS:
-        try:
-            payload = {
-                "model": model_name,
-                "messages": messages,
-                "temperature": 0.2,
-            }
-            resp = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=45,
-            )
-            if resp.status_code != 200:
-                last_error = f"HTTP {resp.status_code}"
-                continue
-            data = resp.json()
-            ans = data["choices"][0]["message"]["content"]
-            if ans and ans.strip():
-                return ans.strip()
-        except Exception as e:
-            last_error = str(e)
-            continue
+    waves = [
+        ("openrouter", FREE_TEXT_MODELS_PRIMARY, 0.0),
+        ("gemini", GEMINI_STUDIO_MODELS[:3], 0.0),
+        ("openrouter", FREE_TEXT_MODELS_SECONDARY, 1.0),
+        ("gemini", GEMINI_STUDIO_MODELS[3:] + ["gemini-2.0-flash"], 1.0),
+    ]
 
-    raise RuntimeError(f"خطا در دریافت پاسخ از مشاور هوشمند: {last_error}")
+    for provider, wave_models, delay_sec in waves:
+        if provider == "gemini" and not _has_valid_gemini_key():
+            continue
+        if provider == "openrouter" and not _has_valid_openrouter_key():
+            continue
+        if delay_sec > 0:
+            time.sleep(delay_sec)
+
+        for model_name in wave_models:
+            try:
+                if provider == "openrouter":
+                    ans = _call_openrouter_single(messages, model_name, temperature=0.2)
+                else:
+                    ans = _call_google_ai_studio_single(messages, model_name, temperature=0.2, json_mode=False)
+                if ans and ans.strip():
+                    return ans.strip()
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+    raise RuntimeError(f"خطا در دریافت پاسخ از مشاور هوشمند (OpenRouter / Google AI Studio): {last_error}")
 
 
 def is_question_or_catalog_inquiry(text: str) -> bool:
@@ -874,48 +1034,51 @@ def transcribe_audio_high_accuracy(audio_path: str, audio_format: str = "ogg") -
             except Exception as e2:
                 logger.warning(f"Google STT simple fallback error: {e2}")
 
-    # اگر سرویس گوگل در دسترس نبود، از مدل صوتی رایگان OpenRouter برای پیاده‌سازی متن استفاده می‌کنیم
+    # اگر سرویس گوگل در دسترس نبود، به صورت چرخشی از OpenRouter و Google AI Studio برای پیاده‌سازی متن ویس استفاده می‌کنیم
     if not raw_text:
         try:
             with open(audio_path, "rb") as f:
                 b64_audio = base64.b64encode(f.read()).decode("utf-8")
-            headers = {
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            }
-            for model_name in FREE_AUDIO_MODELS:
-                payload = {
-                    "model": model_name,
-                    "messages": [
+            audio_messages = [
+                {
+                    "role": "user",
+                    "content": [
                         {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": "لطفاً این ویس سفارش لنت ترمز را کلمه به کلمه و دقیق به متن فارسی تبدیل کن (اصطلاحات با شیم، بدون شیم، ۵ میل، ۶ میل و نام خودروها را دقیق بنویس). فقط متن پیاده‌شده را بدون هیچ توضیح اضافه‌ای برگردان.",
-                                },
-                                {
-                                    "type": "input_audio",
-                                    "input_audio": {"data": b64_audio, "format": audio_format},
-                                },
-                            ],
-                        }
+                            "type": "text",
+                            "text": "لطفاً این ویس سفارش لنت ترمز را کلمه به کلمه و دقیق به متن فارسی تبدیل کن (اصطلاحات با شیم، بدون شیم، ۵ میل، ۶ میل و نام خودروها را دقیق بنویس). فقط متن پیاده‌شده را بدون هیچ توضیح اضافه‌ای برگردان.",
+                        },
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": b64_audio, "format": audio_format},
+                        },
                     ],
-                    "temperature": 0.0,
                 }
-                r = requests.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers=headers,
-                    json=payload,
-                    timeout=35,
-                )
-                if r.status_code == 200:
-                    txt = r.json()["choices"][0]["message"]["content"].strip()
-                    if txt:
-                        raw_text = txt
-                        break
+            ]
+            audio_waves = [
+                ("openrouter", FREE_AUDIO_MODELS),
+                ("gemini", ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]),
+                ("openrouter", ["openrouter/free"]),
+            ]
+            for provider, a_models in audio_waves:
+                if raw_text:
+                    break
+                if provider == "gemini" and not _has_valid_gemini_key():
+                    continue
+                if provider == "openrouter" and not _has_valid_openrouter_key():
+                    continue
+                for m_name in a_models:
+                    try:
+                        if provider == "openrouter":
+                            txt = _call_openrouter_single(audio_messages, m_name, temperature=0.0)
+                        else:
+                            txt = _call_google_ai_studio_single(audio_messages, m_name, temperature=0.0, json_mode=False)
+                        if txt:
+                            raw_text = txt
+                            break
+                    except Exception as e_aud:
+                        logger.warning(f"[{provider}] Audio fallback error on {m_name}: {e_aud}")
         except Exception as e:
-            logger.warning(f"OpenRouter audio transcription fallback error: {e}")
+            logger.warning(f"Audio transcription fallback error: {e}")
 
     if not raw_text:
         raise RuntimeError("متأسفانه صدای واضحی از ویس دریافت نشد. لطفاً مجدداً ویس بفرستید یا سفارش را تایپ کنید.")
@@ -1670,6 +1833,8 @@ def enforce_wholesale_minimum_rule(order_data: dict, chat_id: int) -> str:
     قانون حداقل تعداد سفارش عمده:
     - اگر کاربر در حالت «سفارش عمده» باشد و جمع کل لنت‌های سفارش کمتر از ۱۵ دست باشد:
       پیام می‌دهد که «این سفارش، سفارش عمده محسوب نمی‌شود» و سفارش را خودکار به «سفارش خرد» برمی‌گرداند.
+    - استثناء حالت ویژه (VIP): اگر کاربر ویژه دکمه «تغییر به سفارش عمده» را زده باشد (`force_wholesale=True`)،
+      سفارش حتی با تعداد کمتر از ۱۵ دست هم روی «سفارش عمده» باقی می‌ماند و با قیمت عمده پیش‌فاکتور/فاکتور می‌شود.
     """
     order_mode = order_data.get("order_mode", get_user_order_mode(chat_id))
     total_qty = sum(i["qty"] for i in order_data.get("items", []))
@@ -1678,8 +1843,14 @@ def enforce_wholesale_minimum_rule(order_data: dict, chat_id: int) -> str:
     # حذف هشدارهای قدیمی مربوط به حداقل خرید
     order_data["warnings"] = [
         w for w in order_data.get("warnings", [])
-        if "حداقل خرید عمده" not in w and "سفارش عمده محسوب" not in w
+        if "حداقل خرید عمده" not in w and "سفارش عمده محسوب" not in w and "حداقل استاندارد خرید عمده" not in w
     ]
+
+    if order_data.get("force_wholesale"):
+        order_data["order_mode"] = "wholesale"
+        USER_ORDER_MODES[chat_id] = "wholesale"
+        apply_order_mode_pricing_to_items(order_data["items"], order_mode="wholesale")
+        return ""
 
     if order_mode == "wholesale" and 0 < total_qty < 15:
         order_data["order_mode"] = "retail"
@@ -1757,16 +1928,47 @@ def format_draft_order_summary(order_data: dict, is_vip: bool = False) -> str:
     return "\n".join(lines)
 
 
-def get_draft_summary_keyboard(is_vip: bool = False) -> InlineKeyboardMarkup:
-    """سه دکمه اصلی زیر پیش‌نمایش لنت‌های تشخیص داده شده: تایید، اصلاح، بازگشت به منوی اصلی"""
+def get_draft_summary_keyboard(is_vip: bool = False, order_data: dict = None) -> InlineKeyboardMarkup:
+    """دکمه‌های زیر پیش‌نمایش لنت‌های تشخیص داده شده (شامل دکمه تغییر به سفارش عمده و صدور پیش‌فاکتور عمده در حالت ویژه)"""
     confirm_label = "✅ تایید و صدور مستقیم فاکتور / پیش‌فاکتور" if is_vip else "✅ تایید و دریافت پیش‌فاکتور"
-    return InlineKeyboardMarkup(
+    rows = [
         [
-            [
-                InlineKeyboardButton(
-                    confirm_label, callback_data="draft_confirm"
-                )
-            ],
+            InlineKeyboardButton(
+                confirm_label, callback_data="draft_confirm"
+            )
+        ]
+    ]
+    if is_vip:
+        curr_mode = (order_data or {}).get("order_mode", "wholesale")
+        if curr_mode == "retail":
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "📦 تغییر به «سفارش عمده» و صدور پیش‌فاکتور عمده",
+                        callback_data="vip_draft_wholesale_proforma",
+                    )
+                ]
+            )
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "🔄 تغییر قیمت پیش‌نمایش به «📦 سفارش عمده»",
+                        callback_data="draft_toggle_ordermode",
+                    )
+                ]
+            )
+        else:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "🛍 تغییر قیمت پیش‌نمایش به «سفارش خرد»",
+                        callback_data="draft_toggle_ordermode",
+                    )
+                ]
+            )
+
+    rows.extend(
+        [
             [
                 InlineKeyboardButton(
                     "✏️ اصلاح اقلام سفارش", callback_data="draft_edit_menu"
@@ -1779,6 +1981,7 @@ def get_draft_summary_keyboard(is_vip: bool = False) -> InlineKeyboardMarkup:
             ],
         ]
     )
+    return InlineKeyboardMarkup(rows)
 
 
 def get_draft_edit_list_keyboard(order_data: dict, is_vip: bool = False) -> InlineKeyboardMarkup:
@@ -1799,6 +2002,15 @@ def get_draft_edit_list_keyboard(order_data: dict, is_vip: bool = False) -> Inli
         buttons.append(
             [InlineKeyboardButton(confirm_label, callback_data="draft_confirm")]
         )
+        if is_vip and order_data.get("order_mode") == "retail":
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        "📦 تغییر به «سفارش عمده» و صدور پیش‌فاکتور عمده",
+                        callback_data="vip_draft_wholesale_proforma",
+                    )
+                ]
+            )
     buttons.append(
         [InlineKeyboardButton("🏠 بازگشت به منوی اصلی", callback_data="back_to_main_menu")]
     )
@@ -1924,6 +2136,35 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔘 **بخش مورد نظر خود را انتخاب کنید** (حالت فعلی: `{get_order_mode_label(current_mode)}`):",
         parse_mode="Markdown",
         reply_markup=get_start_mode_inline_keyboard(current_mode, user_id=user_id),
+    )
+
+
+async def set_gemini_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دستور ویژه مدیر (/setgemini) برای تنظیم یا تغییر کلید رایگان Google AI Studio"""
+    global RUNTIME_GEMINI_API_KEY
+    user_id = update.effective_user.id if update.effective_user else 0
+    if user_id != ADMIN_TELEGRAM_ID and not is_user_vip(user_id):
+        await update.message.reply_text("⛔ این دستور فقط مخصوص مدیر سیستم است.")
+        return
+
+    new_key = " ".join(context.args).strip() if context.args else ""
+    if not new_key:
+        status_txt = "✅ فعال (تنظیم شده)" if _has_valid_gemini_key() else "⚠️ تنظیم نشده"
+        await update.message.reply_text(
+            f"🔑 **وضعیت کلید Google AI Studio (Gemini):** `{status_txt}`\n\n"
+            "برای دریافت کلید رایگان وارد لینک زیر شوید:\n"
+            "https://aistudio.google.com/apikey\n\n"
+            "سپس کلید را در Koyeb در متغیر محیطی `GEMINI_API_KEY` قرار دهید یا در همین چت به صورت زیر ارسال کنید:\n"
+            "`/setgemini AIzaSy...`",
+            parse_mode="Markdown",
+        )
+        return
+
+    RUNTIME_GEMINI_API_KEY = new_key
+    await update.message.reply_text(
+        "✅ کلید **Google AI Studio (Gemini)** با موفقیت ثبت شد!\n"
+        "از این لحظه در صورت شلوغ بودن OpenRouter، ربات به صورت خودکار از Google AI Studio استفاده می‌کند و بالعکس.",
+        parse_mode="Markdown",
     )
 
 
@@ -2507,7 +2748,7 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await wait_msg.edit_text(
             summary_txt,
             parse_mode="Markdown",
-            reply_markup=get_draft_summary_keyboard(is_vip=vip_flag),
+            reply_markup=get_draft_summary_keyboard(is_vip=vip_flag, order_data=order_data),
         )
 
     except Exception as e:
@@ -2627,7 +2868,7 @@ async def handle_photo_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await wait_msg.edit_text(
             summary_txt,
             parse_mode="Markdown",
-            reply_markup=get_draft_summary_keyboard(is_vip=vip_flag),
+            reply_markup=get_draft_summary_keyboard(is_vip=vip_flag, order_data=order_data),
         )
 
     except Exception as e:
@@ -2773,7 +3014,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 summary_txt,
                 parse_mode="Markdown",
-                reply_markup=get_draft_summary_keyboard(is_vip=vip_flag),
+                reply_markup=get_draft_summary_keyboard(is_vip=vip_flag, order_data=order_data),
             )
         except Exception as e:
             logger.exception("Error extracting draft order from confirmed voice")
@@ -3250,6 +3491,63 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_vip_direct_invoice_pdf(chat_id, order_data, context)
         return
 
+    if data == "draft_toggle_ordermode":
+        if not vip_flag:
+            await query.answer("🔒 این قابلیت مخصوص حالت ویژه (رمزدار) است.", show_alert=True)
+            return
+        draft = PENDING_DRAFT_ORDERS.get(chat_id)
+        if not draft:
+            await query.answer("⚠️ سفارش فعلی یافت نشد.", show_alert=True)
+            return
+        curr_mode = draft.get("order_mode", "wholesale")
+        new_mode = "wholesale" if curr_mode == "retail" else "retail"
+        draft["order_mode"] = new_mode
+        draft["force_wholesale"] = (new_mode == "wholesale")
+        USER_ORDER_MODES[chat_id] = new_mode
+        draft["warnings"] = [
+            w for w in draft.get("warnings", [])
+            if "حداقل خرید عمده" not in w and "سفارش عمده محسوب" not in w and "حداقل استاندارد خرید عمده" not in w
+        ]
+        apply_order_mode_pricing_to_items(draft["items"], order_mode=new_mode)
+        mode_fa = "📦 سفارش عمده" if new_mode == "wholesale" else "🛍 سفارش خرد"
+        await query.answer(f"✅ حالت سفارش به «{mode_fa}» تغییر یافت.")
+        await query.edit_message_text(
+            format_draft_order_summary(draft, is_vip=vip_flag),
+            parse_mode="Markdown",
+            reply_markup=get_draft_summary_keyboard(is_vip=vip_flag, order_data=draft),
+        )
+        return
+
+    if data == "vip_draft_wholesale_proforma":
+        if not vip_flag:
+            await query.answer("🔒 این قابلیت مخصوص حالت ویژه (رمزدار) است.", show_alert=True)
+            return
+        draft = PENDING_DRAFT_ORDERS.pop(chat_id, None)
+        USER_EDIT_STATE.pop(chat_id, None)
+        if not draft or not draft.get("items"):
+            await query.edit_message_text("⚠️ هیچ لنتی در سفارش وجود ندارد. لطفاً سفارش جدید ارسال کنید.")
+            return
+        draft["order_mode"] = "wholesale"
+        draft["force_wholesale"] = True
+        draft["doc_type"] = "پیش‌فاکتور"
+        USER_ORDER_MODES[chat_id] = "wholesale"
+        draft["warnings"] = [
+            w for w in draft.get("warnings", [])
+            if "حداقل خرید عمده" not in w and "سفارش عمده محسوب" not in w and "حداقل استاندارد خرید عمده" not in w
+        ]
+        apply_order_mode_pricing_to_items(draft["items"], order_mode="wholesale")
+        await query.edit_message_text("⏳ در حال صدور پیش‌فاکتور با قیمت «📦 سفارش عمده» (حالت ویژه VIP)...")
+        try:
+            LAST_ORDERS[chat_id] = draft
+            await send_vip_direct_invoice_pdf(
+                chat_id, draft, context, extra_note=draft.get("extra_note")
+            )
+            await query.message.delete()
+        except Exception as e:
+            logger.exception("Error generating VIP wholesale proforma PDF")
+            await query.edit_message_text(f"❌ خطا در ساخت PDF:\n`{e}`", parse_mode="Markdown")
+        return
+
     if data == "toggle_ordermode":
         if not vip_flag:
             await query.answer("🔒 این قابلیت مخصوص حالت ویژه (رمزدار) است.", show_alert=True)
@@ -3263,8 +3561,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         new_mode = "retail" if order_data.get("order_mode", "wholesale") == "wholesale" else "wholesale"
         order_data["order_mode"] = new_mode
+        order_data["force_wholesale"] = (new_mode == "wholesale")
+        if new_mode == "wholesale":
+            # وقتی در حالت ویژه روی «تغییر به سفارش عمده» زده می‌شود، پیش‌فاکتور عمده بدون اخطار زیر ۱۵ دست صادر می‌شود
+            order_data["doc_type"] = "پیش‌فاکتور"
+            order_data["warnings"] = [
+                w for w in order_data.get("warnings", [])
+                if "حداقل خرید عمده" not in w and "سفارش عمده محسوب" not in w and "حداقل استاندارد خرید عمده" not in w
+            ]
         USER_ORDER_MODES[chat_id] = new_mode
         apply_order_mode_pricing_to_items(order_data["items"], order_mode=new_mode)
+        await query.answer(f"✅ در حال صدور مجدد با قیمت «{'سفارش عمده' if new_mode == 'wholesale' else 'سفارش خرد'}»...")
         await send_vip_direct_invoice_pdf(chat_id, order_data, context)
         return
 
@@ -3335,6 +3642,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("setbank", set_bank_cmd))
+    app.add_handler(CommandHandler("setgemini", set_gemini_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_excel_upload))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice_order))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_order))
