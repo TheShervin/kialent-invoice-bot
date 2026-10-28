@@ -471,42 +471,69 @@ def calculate_final_unit_price(base_price: int, row_id: str, part_name: str, ord
         return int(round(base_price * 1.10)), 10
 
 
-def get_volume_discount_percent(total_qty: int) -> int:
+def parse_admin_discount_input(raw_text: str, mode: str, subtotal: int) -> tuple:
     """
-    محاسبه درصد تخفیف پلکانی بر اساس مجموع تعداد (دست) در سفارش:
-    - سفارش‌های بیش از ۵۰ دست (از ۵۰ دست به بالا): ۳٪ تخفیف
-    - سفارش‌های بیش از ۱۰۰ دست (از ۱۰۰ دست به بالا): ۵٪ تخفیف
-    - سفارش‌های بیش از ۲۰۰ دست (از ۲۰۰ دست به بالا): ۹٪ تخفیف
+    تحلیل ورودی تخفیف مدیر:
+    - اگر mode == 'percent' یا در متن علامت % / درصد باشد -> تخفیف درصدی
+    - اگر mode == 'amount' -> تخفیف به مبلغ ثابت (به ریال؛ اگر کلمه «تومان» یا «تومن» نوشته شود خودکار × ۱۰ می‌شود)
+    خروجی: (discount_type, discount_value)
     """
-    q = int(total_qty or 0)
-    if q >= 200:
-        return 9
-    elif q >= 100:
-        return 5
-    elif q >= 50:
-        return 3
-    return 0
+    t = to_en_str(raw_text or "").replace(",", "").replace("،", "").strip()
+    is_toman = ("تومان" in t or "تومن" in t)
+    has_pct_sign = ("%" in t or "٪" in t or "درصد" in t)
+
+    m = re.search(r"(\d+(?:\.\d+)?)", t)
+    if not m:
+        raise ValueError("لطفاً یک عدد معتبر وارد کنید.")
+    val = float(m.group(1))
+    if val < 0:
+        raise ValueError("مقدار تخفیف نمی‌تواند منفی باشد.")
+
+    if mode == "percent" or (has_pct_sign and val <= 100):
+        if val > 100:
+            raise ValueError("درصد تخفیف باید بین ۰ تا ۱۰۰ باشد.")
+        return "percent", val
+    else:
+        amt = int(round(val * 10)) if is_toman else int(round(val))
+        if subtotal > 0 and amt > subtotal:
+            amt = subtotal
+        return "amount", amt
 
 
-def calculate_order_financials(items: list) -> dict:
+def calculate_order_financials(items: list, order_data: dict = None) -> dict:
     """
     محاسبه دقیق مبالغ سفارش شامل:
     - جمع کل تعداد (total_qty)
     - جمع کل قبل از تخفیف (subtotal)
-    - درصد تخفیف حجمی (discount_percent: 0, 3, 5, 9)
-    - مبلغ تخفیف به ریال (discount_amount)
+    - تخفیف دستی اعمال‌شده توسط مدیر (بر اساس درصد دلخواه یا مبلغ دلخواه)
     - مبلغ نهایی قابل پرداخت پس از کسر تخفیف (total_payable)
     """
     total_qty = sum(int(it.get("qty", 0)) for it in items)
     subtotal = sum(int(it.get("qty", 0)) * int(it.get("unit_price", 0)) for it in items)
-    discount_pct = get_volume_discount_percent(total_qty)
-    discount_amount = int(round(subtotal * (discount_pct / 100.0))) if discount_pct > 0 else 0
+
+    discount_pct = 0.0
+    discount_amount = 0
+    discount_label = ""
+
+    if order_data:
+        d_type = order_data.get("discount_type")
+        d_val = order_data.get("discount_value", 0) or 0
+        if d_type == "percent" and float(d_val) > 0:
+            discount_pct = float(d_val)
+            discount_amount = int(round(subtotal * (discount_pct / 100.0)))
+            discount_label = f"تخفیف ({format_float_fa(discount_pct)}٪)"
+        elif d_type == "amount" and float(d_val) > 0:
+            discount_amount = min(subtotal, int(round(float(d_val))))
+            discount_pct = round((discount_amount / subtotal) * 100.0, 2) if subtotal > 0 else 0.0
+            discount_label = "تخفیف توافقی"
+
     total_payable = max(0, subtotal - discount_amount)
     return {
         "total_qty": total_qty,
         "subtotal": subtotal,
         "discount_percent": discount_pct,
         "discount_amount": discount_amount,
+        "discount_label": discount_label,
         "total_payable": total_payable,
     }
 
@@ -1209,10 +1236,6 @@ def answer_catalog_question(user_question: str, catalog: list, order_mode: str =
 
 === قوانین و شرایط فروش شرکت ===
 - حداقل خرید عمده: ۲ کارتن یا معادل ۲۰ دست لنت می‌باشد (سفارش‌های کمتر از ۱۵ دست، سفارش عمده محسوب نمی‌شوند و به سفارش خرد منتقل می‌شوند).
-- تخفیف‌های پلکانی خرید حجمی:
-  • سفارش‌های بیش از ۵۰ دست: ۳٪ تخفیف روی کل فاکتور
-  • سفارش‌های بیش از ۱۰۰ دست: ۵٪ تخفیف روی کل فاکتور
-  • سفارش‌های بیش از ۲۰۰ دست: ۹٪ تخفیف روی کل فاکتور
 - نحوه تسویه: تمامی سفارشات به صورت نقدی تسویه می‌شوند.
 - قیمت‌های سفارش عمده تا قبل از ثبت سفارش و صدور پیش‌فاکتور رسمی نمایش داده نمی‌شود؛ اگر مشتری در حالت عمده قیمت تک‌تک لنت‌ها را پرسید، محترمانه بگویید که کافی است لیست سفارش خود را بفرستد تا پیش‌فاکتور رسمی با قیمت روز برایش صادر شود.
 - اگر مشتری پرسید «چه لنت‌هایی دارید؟»، دسته‌بندی کامل لنت‌های تولیدی ما (ایرانی، چینی، شاسی‌بلند و وارداتی) را به صورت مرتب و خوانا معرفی کنید.
@@ -1710,19 +1733,20 @@ def render_invoice_html(
     items: list,
     invoice_no: str = ".........................",
     attachment: str = "دارد",
+    order_data: dict = None,
 ) -> str:
-    fin = calculate_order_financials(items)
+    fin = calculate_order_financials(items, order_data=order_data)
     total_qty = fin["total_qty"]
     subtotal = fin["subtotal"]
-    discount_pct = fin["discount_percent"]
     discount_amount = fin["discount_amount"]
+    discount_label = fin["discount_label"] or "تخفیف"
     total_payable = fin["total_payable"]
     carton_stats = calculate_order_cartons(items)
     total_words = num_to_persian_words(total_payable) + " ریال"
 
     discount_rows_html = ""
     payable_label = "مبلغ قابل پرداخت"
-    if discount_pct > 0:
+    if discount_amount > 0:
         payable_label = "مبلغ قابل پرداخت (پس از کسر تخفیف)"
         discount_rows_html = f"""
                 <tr>
@@ -1730,7 +1754,7 @@ def render_invoice_html(
                     <td class="sum-amount">{to_fa_num(subtotal, comma=True)}</td>
                 </tr>
                 <tr style="background-color: #e8f5e9; color: #1b5e20;">
-                    <td class="sum-label">تخفیف حجمی خرید ({to_fa_num(discount_pct)}٪)</td>
+                    <td class="sum-label">{discount_label}</td>
                     <td class="sum-amount" dir="ltr">-{to_fa_num(discount_amount, comma=True)}</td>
                 </tr>
         """
@@ -2195,6 +2219,7 @@ def generate_pdf_bytes(order_data: dict) -> bytes:
         items=order_data["items"],
         invoice_no=order_data.get("invoice_no", "........................."),
         attachment="دارد",
+        order_data=order_data,
     )
 
     try:
@@ -2400,11 +2425,11 @@ def format_draft_order_summary(order_data: dict, is_vip: bool = False) -> str:
         f"📦 **لنت‌های تشخیص داده شده ({to_fa_num(len(items))} ردیف):**",
     ]
 
-    fin = calculate_order_financials(items)
+    fin = calculate_order_financials(items, order_data=order_data)
     total_qty = fin["total_qty"]
     subtotal = fin["subtotal"]
-    discount_pct = fin["discount_percent"]
     discount_amount = fin["discount_amount"]
+    discount_label = fin["discount_label"] or "تخفیف"
     total_payable = fin["total_payable"]
     carton_stats = calculate_order_cartons(items)
     compact_mode = len(items) > 18
@@ -2413,16 +2438,12 @@ def format_draft_order_summary(order_data: dict, is_vip: bool = False) -> str:
     footer_lines.append(f"📊 **جمع کل تعداد:** `{to_fa_num(total_qty)} دست` ({to_fa_num(len(items))} ردیف کالا)")
     footer_lines.append(f"📦 **محاسبه تعداد کارتن کیا:** `{carton_stats['summary_full']}`")
     if hide_prices:
-        if discount_pct > 0:
-            footer_lines.append(
-                f"🎁 **تخفیف حجمی شامل این سفارش:** `{to_fa_num(discount_pct)}٪ تخفیف ویژه` (در پیش‌فاکتور کسر می‌گردد)"
-            )
         footer_lines.append("💡 _قیمت‌های سفارش عمده پس از تایید اقلام، در فایل «پیش‌فاکتور» درج و نمایش داده می‌شود._")
     else:
-        if discount_pct > 0:
+        if discount_amount > 0:
             footer_lines.append(f"💵 **جمع کل قبل از تخفیف:** `{to_fa_num(subtotal, comma=True)} ریال`")
-            footer_lines.append(f"🎁 **تخفیف حجمی ({to_fa_num(discount_pct)}٪):** `{to_fa_num(discount_amount, comma=True)} ریال`")
-            footer_lines.append(f"💰 **مبلغ کل قابل پرداخت (با تخفیف):** `{to_fa_num(total_payable, comma=True)} ریال`")
+            footer_lines.append(f"🎁 **{discount_label}:** `{to_fa_num(discount_amount, comma=True)} ریال`")
+            footer_lines.append(f"💰 **مبلغ کل قابل پرداخت (پس از تخفیف):** `{to_fa_num(total_payable, comma=True)} ریال`")
         else:
             footer_lines.append(f"💰 **مبلغ کل قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`")
 
@@ -2962,20 +2983,20 @@ async def send_vip_direct_invoice_pdf(
     cust = order_data["customer_title"]
     filename = f"{doc_type} سفارش {cust}.pdf"
 
-    fin = calculate_order_financials(order_data["items"])
+    fin = calculate_order_financials(order_data["items"], order_data=order_data)
     total_qty = fin["total_qty"]
     subtotal = fin["subtotal"]
-    discount_pct = fin["discount_percent"]
     discount_amount = fin["discount_amount"]
+    discount_label = fin["discount_label"] or "تخفیف"
     total_payable = fin["total_payable"]
     carton_stats = calculate_order_cartons(order_data["items"])
     mode_label = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
 
     price_lines = (
         f"💵 جمع قبل از تخفیف: `{to_fa_num(subtotal, comma=True)} ریال`\n"
-        f"🎁 تخفیف حجمی ({to_fa_num(discount_pct)}٪): `{to_fa_num(discount_amount, comma=True)} ریال`\n"
+        f"🎁 {discount_label}: `{to_fa_num(discount_amount, comma=True)} ریال`\n"
         f"💰 مبلغ قابل پرداخت: `{to_fa_num(total_payable, comma=True)} ریال`\n"
-        if discount_pct > 0
+        if discount_amount > 0
         else f"💰 مبلغ قابل پرداخت: `{to_fa_num(total_payable, comma=True)} ریال`\n"
     )
 
@@ -2999,25 +3020,37 @@ async def send_vip_direct_invoice_pdf(
 
     opposite_type = "فاکتور" if doc_type == "پیش‌فاکتور" else "پیش‌فاکتور"
     opposite_mode_label = "🛍 تغییر به «سفارش خرد»" if order_mode == "wholesale" else "📦 تغییر به «سفارش عمده»"
-    keyboard = InlineKeyboardMarkup(
+    kb_rows = [
         [
-            [
-                InlineKeyboardButton(
-                    f"🔄 تبدیل فوری به «{opposite_type}»", callback_data="toggle_doctype"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    opposite_mode_label, callback_data="toggle_ordermode"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "✏️ اصلاح اقلام همین فاکتور", callback_data="reopen_last_order_edit"
-                )
-            ],
-        ]
-    )
+            InlineKeyboardButton(
+                f"🔄 تبدیل فوری به «{opposite_type}»", callback_data="toggle_doctype"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                opposite_mode_label, callback_data="toggle_ordermode"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🎁 تخفیف درصدی", callback_data="vip_disc_pct"
+            ),
+            InlineKeyboardButton(
+                "💵 تخفیف مبلغی", callback_data="vip_disc_amt"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "✏️ اصلاح اقلام همین فاکتور", callback_data="reopen_last_order_edit"
+            )
+        ],
+    ]
+    if discount_amount > 0:
+        kb_rows.insert(
+            3,
+            [InlineKeyboardButton("🗑 حذف تخفیف", callback_data="vip_disc_clear")],
+        )
+    keyboard = InlineKeyboardMarkup(kb_rows)
 
     await context.bot.send_document(
         chat_id=chat_id,
@@ -3099,11 +3132,11 @@ async def send_customer_proforma_pdf(
     cust = order_data["customer_title"]
     filename = f"پیش‌فاکتور سفارش {cust}.pdf"
 
-    fin = calculate_order_financials(order_data["items"])
+    fin = calculate_order_financials(order_data["items"], order_data=order_data)
     total_qty = fin["total_qty"]
     subtotal = fin["subtotal"]
-    discount_pct = fin["discount_percent"]
     discount_amount = fin["discount_amount"]
+    discount_label = fin["discount_label"] or "تخفیف"
     total_payable = fin["total_payable"]
     carton_stats = calculate_order_cartons(order_data["items"])
     mode_label = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
@@ -3119,9 +3152,9 @@ async def send_customer_proforma_pdf(
 
     price_lines = (
         f"💵 جمع قبل از تخفیف: `{to_fa_num(subtotal, comma=True)} ریال`\n"
-        f"🎁 تخفیف حجمی ({to_fa_num(discount_pct)}٪): `{to_fa_num(discount_amount, comma=True)} ریال`\n"
+        f"🎁 {discount_label}: `{to_fa_num(discount_amount, comma=True)} ریال`\n"
         f"💰 مبلغ قابل پرداخت: `{to_fa_num(total_payable, comma=True)} ریال`\n"
-        if discount_pct > 0
+        if discount_amount > 0
         else f"💰 مبلغ قابل پرداخت: `{to_fa_num(total_payable, comma=True)} ریال`\n"
     )
 
@@ -3181,6 +3214,95 @@ async def send_customer_proforma_pdf(
     )
 
 
+def build_admin_proforma_keyboard(oid: str, order_data: dict) -> InlineKeyboardMarkup:
+    """کیبورد مدیریتی مهندس اکبری زیر پیش‌فاکتور مشتری (شامل دکمه‌های اعمال تخفیف به درصد دلخواه یا مبلغ دلخواه)"""
+    has_disc = bool(order_data.get("discount_type") and (order_data.get("discount_value") or 0) > 0)
+    approve_lbl = (
+        "✅ تایید و ارسال پیش‌فاکتور تخفیف‌دار + شماره کارت"
+        if has_disc
+        else "✅ تایید پیش‌فاکتور و ارسال شماره کارت پیش‌فرض"
+    )
+    rows = [
+        [
+            InlineKeyboardButton(
+                approve_lbl,
+                callback_data=f"adm_approve_proforma:{oid}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🎁 اعمال تخفیف (درصد دلخواه)",
+                callback_data=f"adm_disc_pct:{oid}",
+            ),
+            InlineKeyboardButton(
+                "💵 اعمال تخفیف (مبلغ دلخواه)",
+                callback_data=f"adm_disc_amt:{oid}",
+            ),
+        ],
+    ]
+    if has_disc:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "🗑 حذف تخفیف اعمال‌شده",
+                    callback_data=f"adm_disc_clear:{oid}",
+                )
+            ]
+        )
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    "✍️ تایید و تایپ شماره کارت / حساب دلخواه",
+                    callback_data=f"adm_custom_bank:{oid}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ رد پیش‌فاکتور", callback_data=f"adm_reject_proforma:{oid}"
+                )
+            ],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_admin_proforma_caption(oid: str, ord_rec: dict) -> str:
+    """ساخت متن توضیحات پیش‌فاکتور برای مدیر شامل جزئیات مبلغ قبل و بعد از تخفیف"""
+    order_data = ord_rec["order_data"]
+    cust = order_data["customer_title"]
+    fin = calculate_order_financials(order_data["items"], order_data=order_data)
+    carton_stats = calculate_order_cartons(order_data["items"])
+    total_qty = fin["total_qty"]
+    subtotal = fin["subtotal"]
+    discount_amount = fin["discount_amount"]
+    discount_label = fin["discount_label"] or "تخفیف"
+    total_payable = fin["total_payable"]
+    mode_label = "سفارش خرد" if order_data.get("order_mode") == "retail" else "سفارش عمده"
+    full_name = ord_rec.get("customer_full_name", "")
+    user_tag = ord_rec.get("customer_user_tag", f"ID: {ord_rec.get('customer_chat_id')}")
+
+    if discount_amount > 0:
+        price_block = (
+            f"💵 **جمع قبل از تخفیف:** `{to_fa_num(subtotal, comma=True)} ریال`\n"
+            f"🎁 **{discount_label} اعمال‌شده:** `{to_fa_num(discount_amount, comma=True)} ریال`\n"
+            f"💰 **مبلغ نهایی قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`"
+        )
+    else:
+        price_block = f"💰 **مبلغ قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`"
+
+    return (
+        f"🔔 **پیش‌فاکتور سفارش `#{to_fa_num(oid)}`**\n\n"
+        f"👤 **نام مشتری:** `{cust}`\n"
+        f"📱 **تلگرام مشتری:** {full_name} ({user_tag})\n"
+        f"🏷 **نوع سفارش:** `{mode_label}`\n"
+        f"📦 **تعداد کل:** `{to_fa_num(total_qty)}` دست ({to_fa_num(len(order_data['items']))} ردیف)\n"
+        f"📦 **معادل کارتن کیا:** `{carton_stats['summary_full']}`\n"
+        f"{price_block}\n\n"
+        "👇 می‌توانید قبل از تایید، **تخفیف به درصد دلخواه یا مبلغ دلخواه** اعمال کنید و سپس تایید را بزنید:"
+    )
+
+
 async def forward_receipt_to_admin(
     update: Update, context: ContextTypes.DEFAULT_TYPE, ord_rec: dict
 ):
@@ -3188,7 +3310,7 @@ async def forward_receipt_to_admin(
     oid = ord_rec["order_id"]
     order_data = ord_rec["order_data"]
     cust = order_data["customer_title"]
-    fin = calculate_order_financials(order_data["items"])
+    fin = calculate_order_financials(order_data["items"], order_data=order_data)
     total_payable = fin["total_payable"]
     total_qty = fin["total_qty"]
     user = update.effective_user
@@ -3269,29 +3391,114 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id if update.effective_user else chat_id
 
-    # ۰. بررسی اینکه آیا مدیر (مهندس شروین اکبری) در حال وارد کردن «توضیحات زمان تحویل» یا «شماره کارت سفارشی» است
-    if user_id == ADMIN_TELEGRAM_ID and chat_id in ADMIN_STATE:
-        adm_st = ADMIN_STATE.pop(chat_id)
+    # ۰. بررسی اینکه آیا مدیر یا کاربر ویژه در حال وارد کردن «تخفیف درصدی/مبلغی»، «توضیحات زمان تحویل» یا «شماره کارت سفارشی» است
+    if (user_id == ADMIN_TELEGRAM_ID or is_user_vip(user_id)) and chat_id in ADMIN_STATE:
+        adm_st = ADMIN_STATE.get(chat_id)
         st_mode = adm_st.get("mode")
         oid = adm_st.get("order_id")
-        ord_rec = ACTIVE_PAYMENT_ORDERS.get(oid)
 
+        if st_mode in ("awaiting_vip_discount_percent", "awaiting_vip_discount_amount"):
+            order_data = LAST_ORDERS.get(chat_id)
+            if not order_data:
+                ADMIN_STATE.pop(chat_id, None)
+                await update.message.reply_text("⚠️ سفارش فعلی در حافظه یافت نشد.")
+                return
+            subtotal = sum(int(i["qty"]) * int(i["unit_price"]) for i in order_data["items"])
+            disc_mode = "percent" if st_mode == "awaiting_vip_discount_percent" else "amount"
+            try:
+                d_type, d_val = parse_admin_discount_input(user_text, disc_mode, subtotal)
+            except ValueError as ve:
+                await update.message.reply_text(f"⚠️ {ve}\nلطفاً مجدداً عدد را ارسال کنید:")
+                return
+            ADMIN_STATE.pop(chat_id, None)
+            order_data["discount_type"] = d_type
+            order_data["discount_value"] = d_val
+            await update.message.reply_text("✅ تخفیف اعمال شد. در حال صدور مجدد فایل PDF...")
+            await send_vip_direct_invoice_pdf(chat_id, order_data, context)
+            return
+
+        ord_rec = ACTIVE_PAYMENT_ORDERS.get(oid)
         if not ord_rec:
+            ADMIN_STATE.pop(chat_id, None)
             await update.message.reply_text("⚠️ این سفارش در حافظه یافت نشد.")
             return
+
+        if st_mode in ("awaiting_discount_percent", "awaiting_discount_amount"):
+            order_data = ord_rec["order_data"]
+            subtotal = sum(int(i["qty"]) * int(i["unit_price"]) for i in order_data["items"])
+            disc_mode = "percent" if st_mode == "awaiting_discount_percent" else "amount"
+            try:
+                d_type, d_val = parse_admin_discount_input(user_text, disc_mode, subtotal)
+            except ValueError as ve:
+                await update.message.reply_text(f"⚠️ {ve}\nلطفاً مجدداً عدد را ارسال کنید:")
+                return
+
+            ADMIN_STATE.pop(chat_id, None)
+            order_data["discount_type"] = d_type
+            order_data["discount_value"] = d_val
+            order_data["doc_type"] = "پیش‌فاکتور"
+
+            wait_disc = await update.message.reply_text("⏳ در حال اعمال تخفیف و بروزرسانی فایل پیش‌فاکتور...")
+            try:
+                pdf_bytes = generate_pdf_bytes(order_data)
+                cust = order_data["customer_title"]
+                admin_caption = build_admin_proforma_caption(oid, ord_rec)
+                admin_kb = build_admin_proforma_keyboard(oid, order_data)
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=io.BytesIO(pdf_bytes),
+                    filename=f"پیش‌فاکتور تخفیف‌دار {cust} - کد {oid}.pdf",
+                    caption=admin_caption,
+                    parse_mode="Markdown",
+                    reply_markup=admin_kb,
+                )
+                await wait_disc.delete()
+            except Exception as e:
+                logger.exception("Error regenerating discounted proforma")
+                await wait_disc.edit_text(f"❌ خطا در بروزرسانی پیش‌فاکتور: `{e}`", parse_mode="Markdown")
+            return
+
+        ADMIN_STATE.pop(chat_id, None)
 
         if st_mode == "awaiting_custom_bank":
             RUNTIME_PAYMENT_BANK_INFO = user_text
             cust_chat_id = ord_rec["customer_chat_id"]
             ord_rec["status"] = "awaiting_receipt"
             USER_ACTIVE_ORDER_ID[cust_chat_id] = oid
-            total_payable = calculate_order_financials(ord_rec["order_data"]["items"])["total_payable"]
+            order_data = ord_rec["order_data"]
+            fin = calculate_order_financials(order_data["items"], order_data=order_data)
+            subtotal = fin["subtotal"]
+            discount_amount = fin["discount_amount"]
+            discount_label = fin["discount_label"] or "تخفیف"
+            total_payable = fin["total_payable"]
+
+            if discount_amount > 0:
+                try:
+                    order_data["doc_type"] = "پیش‌فاکتور"
+                    disc_pdf = generate_pdf_bytes(order_data)
+                    await context.bot.send_document(
+                        chat_id=cust_chat_id,
+                        document=io.BytesIO(disc_pdf),
+                        filename=f"پیش‌فاکتور تخفیف‌دار سفارش {order_data['customer_title']}.pdf",
+                        caption=f"🎁 **نسخه جدید پیش‌فاکتور شما با اعمال {discount_label} توسط مدیریت**",
+                        parse_mode="Markdown",
+                    )
+                except Exception as e_pdf:
+                    logger.warning(f"Could not send discounted PDF to customer: {e_pdf}")
+
+                price_summary = (
+                    f"💵 **مبلغ اولیه پیش‌فاکتور:** `{to_fa_num(subtotal, comma=True)} ریال`\n"
+                    f"🎁 **{discount_label} مدیریت:** `{to_fa_num(discount_amount, comma=True)} ریال`\n"
+                    f"💰 **مبلغ نهایی قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`"
+                )
+            else:
+                price_summary = f"💰 **مبلغ قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`"
 
             await context.bot.send_message(
                 chat_id=cust_chat_id,
                 text=(
                     f"✅ **پیش‌فاکتور سفارش `#{to_fa_num(oid)}` شما توسط مدیریت تایید شد!**\n\n"
-                    f"💰 **مبلغ قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`\n\n"
+                    f"{price_summary}\n\n"
                     f"💳 **اطلاعات حساب و شماره کارت جهت واریز:**\n{user_text}\n\n"
                     "📸 **لطفاً پس از واریز وجه، تصویر رسید پرداخت خود را در همین چت ارسال فرمایید تا فاکتور نهایی و زمان تحویل برایتان صادر شود.**"
                 ),
@@ -3316,14 +3523,19 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pdf_bytes = generate_pdf_bytes(order_data)
                 cust = order_data["customer_title"]
                 filename = f"فاکتور سفارش {cust}.pdf"
-                total_payable = sum(i["qty"] * i["unit_price"] for i in order_data["items"])
-                total_qty = sum(i["qty"] for i in order_data["items"])
+                fin = calculate_order_financials(order_data["items"], order_data=order_data)
+                total_payable = fin["total_payable"]
+                total_qty = fin["total_qty"]
+                disc_amt = fin["discount_amount"]
+                disc_lbl = fin["discount_label"] or "تخفیف"
+                disc_line = f"🎁 {disc_lbl}: `{to_fa_num(disc_amt, comma=True)} ریال`\n" if disc_amt > 0 else ""
 
                 final_caption = (
                     f"🎉 **فاکتور نهایی سفارش {cust}** (تسویه شده)\n"
                     f"🔢 کد سفارش: `#{to_fa_num(oid)}`\n"
                     f"📅 تاریخ: `{to_fa_num(order_data['date'])}`\n"
                     f"📦 تعداد کل: `{to_fa_num(total_qty)}` دست\n"
+                    f"{disc_line}"
                     f"💰 مبلغ کل: `{to_fa_num(total_payable, comma=True)} ریال`\n\n"
                     f"🚚 **توضیحات مدیریت بابت زمان و نحوه تحویل بار:**\n"
                     f"« {delivery_note} »\n\n"
@@ -4020,39 +4232,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         user_tag = f"@{user.username}" if (user and user.username) else f"ID: {user.id if user else chat_id}"
         full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() if user else ""
+        ord_rec["customer_user_tag"] = user_tag
+        ord_rec["customer_full_name"] = full_name
 
         try:
             pdf_bytes = generate_pdf_bytes(order_data)
-            admin_caption = (
-                f"🔔 **درخواست تایید پیش‌فاکتور جدید `#{to_fa_num(oid)}`**\n\n"
-                f"👤 **نام مشتری:** `{cust}`\n"
-                f"📱 **تلگرام مشتری:** {full_name} ({user_tag})\n"
-                f"🏷 **نوع سفارش:** `{mode_label}`\n"
-                f"📦 **تعداد کل:** `{to_fa_num(total_qty)}` دست ({to_fa_num(len(order_data['items']))} ردیف)\n"
-                f"💰 **مبلغ قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`\n\n"
-                "👇 در صورت تایید، دکمه زیر را بزنید تا اطلاعات حساب و شماره کارت برای مشتری ارسال شود:"
-            )
-            admin_kb = InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "✅ تایید پیش‌فاکتور و ارسال شماره کارت پیش‌فرض",
-                            callback_data=f"adm_approve_proforma:{oid}",
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "✍️ تایید و تایپ شماره کارت / حساب دلخواه",
-                            callback_data=f"adm_custom_bank:{oid}",
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "❌ رد پیش‌فاکتور", callback_data=f"adm_reject_proforma:{oid}"
-                        )
-                    ],
-                ]
-            )
+            admin_caption = build_admin_proforma_caption(oid, ord_rec)
+            admin_kb = build_admin_proforma_keyboard(oid, order_data)
             await context.bot.send_document(
                 chat_id=ADMIN_TELEGRAM_ID,
                 document=io.BytesIO(pdf_bytes),
@@ -4100,7 +4286,124 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # ۷. دکمه‌های پنل مدیریت (مهندس شروین اکبری - ID: 84838606)
+    # ۷. دکمه‌های پنل مدیریت (مهندس شروین اکبری - ID: 84838606) شامل اعمال تخفیف درصدی و مبلغی دلخواه
+    if data.startswith("adm_disc_pct:"):
+        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+            await query.answer("⛔ فقط مدیر سیستم مجاز است.", show_alert=True)
+            return
+        oid = data.split(":")[1]
+        ord_rec = ACTIVE_PAYMENT_ORDERS.get(oid)
+        if not ord_rec:
+            await query.message.reply_text("⚠️ این سفارش در حافظه یافت نشد.")
+            return
+        ADMIN_STATE[chat_id] = {"mode": "awaiting_discount_percent", "order_id": oid}
+        fin = calculate_order_financials(ord_rec["order_data"]["items"], order_data=ord_rec["order_data"])
+        quick_kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("۳٪", callback_data=f"adm_quick_pct:{oid}:3"),
+                    InlineKeyboardButton("۵٪", callback_data=f"adm_quick_pct:{oid}:5"),
+                    InlineKeyboardButton("۷٪", callback_data=f"adm_quick_pct:{oid}:7"),
+                    InlineKeyboardButton("۱۰٪", callback_data=f"adm_quick_pct:{oid}:10"),
+                ],
+                [
+                    InlineKeyboardButton("۱۵٪", callback_data=f"adm_quick_pct:{oid}:15"),
+                    InlineKeyboardButton("۲۰٪", callback_data=f"adm_quick_pct:{oid}:20"),
+                ],
+                [
+                    InlineKeyboardButton("🔙 انصراف", callback_data=f"adm_cancel_disc:{oid}")
+                ],
+            ]
+        )
+        await query.message.reply_text(
+            f"🎁 **اعمال تخفیف درصدی روی پیش‌فاکتور `#{to_fa_num(oid)}`:**\n"
+            f"💵 جمع فعلی قبل از تخفیف: `{to_fa_num(fin['subtotal'], comma=True)} ریال`\n\n"
+            "✍️ **لطفاً درصد تخفیف دلخواه خود را به صورت عدد تایپ و ارسال کنید** (مثلاً `4` یا `6.5`) و یا یکی از گزینه‌های آماده زیر را انتخاب نمایید:",
+            parse_mode="Markdown",
+            reply_markup=quick_kb,
+        )
+        return
+
+    if data.startswith("adm_quick_pct:"):
+        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+            await query.answer("⛔ فقط مدیر سیستم مجاز است.", show_alert=True)
+            return
+        _, oid, pct_str = data.split(":")
+        ord_rec = ACTIVE_PAYMENT_ORDERS.get(oid)
+        if not ord_rec:
+            await query.message.reply_text("⚠️ این سفارش در حافظه یافت نشد.")
+            return
+        ADMIN_STATE.pop(chat_id, None)
+        order_data = ord_rec["order_data"]
+        order_data["discount_type"] = "percent"
+        order_data["discount_value"] = float(pct_str)
+        order_data["doc_type"] = "پیش‌فاکتور"
+        await query.answer(f"✅ تخفیف {to_fa_num(pct_str)}٪ اعمال شد.")
+        pdf_bytes = generate_pdf_bytes(order_data)
+        cust = order_data["customer_title"]
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=io.BytesIO(pdf_bytes),
+            filename=f"پیش‌فاکتور تخفیف‌دار {cust} - کد {oid}.pdf",
+            caption=build_admin_proforma_caption(oid, ord_rec),
+            parse_mode="Markdown",
+            reply_markup=build_admin_proforma_keyboard(oid, order_data),
+        )
+        return
+
+    if data.startswith("adm_disc_amt:"):
+        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+            await query.answer("⛔ فقط مدیر سیستم مجاز است.", show_alert=True)
+            return
+        oid = data.split(":")[1]
+        ord_rec = ACTIVE_PAYMENT_ORDERS.get(oid)
+        if not ord_rec:
+            await query.message.reply_text("⚠️ این سفارش در حافظه یافت نشد.")
+            return
+        ADMIN_STATE[chat_id] = {"mode": "awaiting_discount_amount", "order_id": oid}
+        fin = calculate_order_financials(ord_rec["order_data"]["items"], order_data=ord_rec["order_data"])
+        await query.message.reply_text(
+            f"💵 **اعمال تخفیف به مبلغ دلخواه روی پیش‌فاکتور `#{to_fa_num(oid)}`:**\n"
+            f"💵 جمع فعلی قبل از تخفیف: `{to_fa_num(fin['subtotal'], comma=True)} ریال`\n\n"
+            "✍️ **لطفاً مبلغ تخفیف مورد نظر را به ریال تایپ و ارسال کنید** (مثلاً `5000000` برای ۵ میلیون ریال؛ اگر به تومان بنویسید مثلاً `500000 تومان` خودکار به ریال تبدیل می‌شود):",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 انصراف", callback_data=f"adm_cancel_disc:{oid}")]]
+            ),
+        )
+        return
+
+    if data.startswith("adm_disc_clear:"):
+        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+            await query.answer("⛔ فقط مدیر سیستم مجاز است.", show_alert=True)
+            return
+        oid = data.split(":")[1]
+        ord_rec = ACTIVE_PAYMENT_ORDERS.get(oid)
+        if not ord_rec:
+            await query.message.reply_text("⚠️ این سفارش در حافظه یافت نشد.")
+            return
+        ADMIN_STATE.pop(chat_id, None)
+        order_data = ord_rec["order_data"]
+        order_data.pop("discount_type", None)
+        order_data.pop("discount_value", None)
+        await query.answer("🗑 تخفیف حذف شد.")
+        pdf_bytes = generate_pdf_bytes(order_data)
+        cust = order_data["customer_title"]
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=io.BytesIO(pdf_bytes),
+            filename=f"پیش‌فاکتور {cust} - کد {oid}.pdf",
+            caption=build_admin_proforma_caption(oid, ord_rec),
+            parse_mode="Markdown",
+            reply_markup=build_admin_proforma_keyboard(oid, order_data),
+        )
+        return
+
+    if data.startswith("adm_cancel_disc:"):
+        ADMIN_STATE.pop(chat_id, None)
+        await query.edit_message_text("👌 عملیات اعمال تخفیف لغو شد. می‌توانید از دکمه‌های زیر پیش‌فاکتور استفاده کنید.")
+        return
+
     if data.startswith("adm_approve_proforma:"):
         if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
             await query.answer("⛔ فقط مدیر سیستم مجاز به تایید است.", show_alert=True)
@@ -4111,23 +4414,51 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("⚠️ این سفارش در حافظه یافت نشد.")
             return
 
+        ADMIN_STATE.pop(chat_id, None)
         ord_rec["status"] = "awaiting_receipt"
         cust_chat_id = ord_rec["customer_chat_id"]
         USER_ACTIVE_ORDER_ID[cust_chat_id] = oid
-        total_payable = calculate_order_financials(ord_rec["order_data"]["items"])["total_payable"]
+        order_data = ord_rec["order_data"]
+        fin = calculate_order_financials(order_data["items"], order_data=order_data)
+        subtotal = fin["subtotal"]
+        discount_amount = fin["discount_amount"]
+        discount_label = fin["discount_label"] or "تخفیف"
+        total_payable = fin["total_payable"]
+
+        if discount_amount > 0:
+            try:
+                order_data["doc_type"] = "پیش‌فاکتور"
+                disc_pdf = generate_pdf_bytes(order_data)
+                await context.bot.send_document(
+                    chat_id=cust_chat_id,
+                    document=io.BytesIO(disc_pdf),
+                    filename=f"پیش‌فاکتور تخفیف‌دار سفارش {order_data['customer_title']}.pdf",
+                    caption=f"🎁 **پیش‌فاکتور اصلاح‌شده شما با اعمال {discount_label} توسط مدیریت**",
+                    parse_mode="Markdown",
+                )
+            except Exception as e_pdf:
+                logger.warning(f"Could not send discounted PDF to customer: {e_pdf}")
+
+            price_summary = (
+                f"💵 **مبلغ اولیه پیش‌فاکتور:** `{to_fa_num(subtotal, comma=True)} ریال`\n"
+                f"🎁 **{discount_label} مدیریت:** `{to_fa_num(discount_amount, comma=True)} ریال`\n"
+                f"💰 **مبلغ نهایی قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`"
+            )
+        else:
+            price_summary = f"💰 **مبلغ قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`"
 
         await context.bot.send_message(
             chat_id=cust_chat_id,
             text=(
                 f"✅ **پیش‌فاکتور سفارش `#{to_fa_num(oid)}` شما توسط مدیریت تایید شد!**\n\n"
-                f"💰 **مبلغ قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`\n\n"
+                f"{price_summary}\n\n"
                 f"{RUNTIME_PAYMENT_BANK_INFO}\n\n"
                 "📸 **لطفاً پس از واریز وجه، تصویر رسید پرداخت خود را در همین چت ارسال فرمایید تا پس از تایید، فاکتور نهایی و زمان تحویل بار برایتان صادر گردد.**"
             ),
             parse_mode="Markdown",
         )
         await query.message.reply_text(
-            f"✅ پیش‌فاکتور `#{to_fa_num(oid)}` تایید شد و اطلاعات حساب/کارت برای مشتری (`{ord_rec['order_data']['customer_title']}`) ارسال گردید."
+            f"✅ پیش‌فاکتور `#{to_fa_num(oid)}` تایید شد و به همراه اطلاعات حساب/کارت برای مشتری (`{order_data['customer_title']}`) ارسال گردید."
         )
         return
 
@@ -4395,6 +4726,56 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ۹. تبدیل فوری فاکتور <-> پیش‌فاکتور (فقط برای کاربران دارای رمز VIP)
+    if data == "vip_disc_pct":
+        if not vip_flag:
+            await query.answer("🔒 این قابلیت مخصوص حالت ویژه است.", show_alert=True)
+            return
+        order_data = LAST_ORDERS.get(chat_id)
+        if not order_data:
+            await query.message.reply_text("⚠️ سفارش فعلی در حافظه یافت نشد.")
+            return
+        ADMIN_STATE[chat_id] = {"mode": "awaiting_vip_discount_percent"}
+        fin = calculate_order_financials(order_data["items"], order_data=order_data)
+        await query.message.reply_text(
+            f"🎁 **اعمال تخفیف درصدی:**\n"
+            f"💵 جمع قبل از تخفیف: `{to_fa_num(fin['subtotal'], comma=True)} ریال`\n\n"
+            "✍️ لطفاً **درصد تخفیف دلخواه** (مثلاً `5` یا `3.5`) را در چت تایپ و ارسال کنید:",
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "vip_disc_amt":
+        if not vip_flag:
+            await query.answer("🔒 این قابلیت مخصوص حالت ویژه است.", show_alert=True)
+            return
+        order_data = LAST_ORDERS.get(chat_id)
+        if not order_data:
+            await query.message.reply_text("⚠️ سفارش فعلی در حافظه یافت نشد.")
+            return
+        ADMIN_STATE[chat_id] = {"mode": "awaiting_vip_discount_amount"}
+        fin = calculate_order_financials(order_data["items"], order_data=order_data)
+        await query.message.reply_text(
+            f"💵 **اعمال تخفیف به مبلغ دلخواه:**\n"
+            f"💵 جمع قبل از تخفیف: `{to_fa_num(fin['subtotal'], comma=True)} ریال`\n\n"
+            "✍️ لطفاً **مبلغ تخفیف دلخواه (به ریال)** را در چت تایپ و ارسال کنید:",
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "vip_disc_clear":
+        if not vip_flag:
+            await query.answer("🔒 این قابلیت مخصوص حالت ویژه است.", show_alert=True)
+            return
+        order_data = LAST_ORDERS.get(chat_id)
+        if not order_data:
+            await query.message.reply_text("⚠️ سفارش فعلی در حافظه یافت نشد.")
+            return
+        order_data.pop("discount_type", None)
+        order_data.pop("discount_value", None)
+        await query.answer("🗑 تخفیف حذف شد.")
+        await send_vip_direct_invoice_pdf(chat_id, order_data, context)
+        return
+
     if data == "toggle_doctype":
         if not vip_flag:
             await query.answer("🔒 دریافت مستقیم فاکتور بدون تایید پرداخت فقط با وارد کردن رمز امکان‌پذیر است.", show_alert=True)
