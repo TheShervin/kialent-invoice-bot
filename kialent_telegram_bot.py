@@ -3215,13 +3215,26 @@ async def send_customer_proforma_pdf(
 
 
 def build_admin_proforma_keyboard(oid: str, order_data: dict) -> InlineKeyboardMarkup:
-    """کیبورد مدیریتی مهندس اکبری زیر پیش‌فاکتور مشتری (شامل دکمه‌های اعمال تخفیف به درصد دلخواه یا مبلغ دلخواه)"""
+    """کیبورد مدیریتی مهندس اکبری زیر پیش‌فاکتور مشتری (شامل محاسبه با قیمت عمده/خرد و اعمال تخفیف درصدی/مبلغی)"""
     has_disc = bool(order_data.get("discount_type") and (order_data.get("discount_value") or 0) > 0)
+    is_modified = has_disc or bool(order_data.get("admin_modified_pricing"))
     approve_lbl = (
-        "✅ تایید و ارسال پیش‌فاکتور تخفیف‌دار + شماره کارت"
-        if has_disc
+        "✅ تایید و ارسال پیش‌فاکتور اصلاح‌شده + شماره کارت"
+        if is_modified
         else "✅ تایید پیش‌فاکتور و ارسال شماره کارت پیش‌فرض"
     )
+    curr_mode = order_data.get("order_mode", "wholesale")
+    if curr_mode == "retail":
+        mode_switch_btn = InlineKeyboardButton(
+            "📦 محاسبه با قیمت عمده",
+            callback_data=f"adm_switch_mode:{oid}:wholesale",
+        )
+    else:
+        mode_switch_btn = InlineKeyboardButton(
+            "🛍 محاسبه با قیمت خرد",
+            callback_data=f"adm_switch_mode:{oid}:retail",
+        )
+
     rows = [
         [
             InlineKeyboardButton(
@@ -3229,6 +3242,7 @@ def build_admin_proforma_keyboard(oid: str, order_data: dict) -> InlineKeyboardM
                 callback_data=f"adm_approve_proforma:{oid}",
             )
         ],
+        [mode_switch_btn],
         [
             InlineKeyboardButton(
                 "🎁 اعمال تخفیف (درصد دلخواه)",
@@ -3472,22 +3486,26 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             discount_label = fin["discount_label"] or "تخفیف"
             total_payable = fin["total_payable"]
 
-            if discount_amount > 0:
+            if discount_amount > 0 or order_data.get("admin_modified_pricing"):
                 try:
                     order_data["doc_type"] = "پیش‌فاکتور"
                     disc_pdf = generate_pdf_bytes(order_data)
+                    mode_note = "با قیمت عمده" if order_data.get("order_mode") == "wholesale" and order_data.get("admin_modified_pricing") else ""
+                    cap_parts = [p for p in [mode_note, f"با اعمال {discount_label}" if discount_amount > 0 else ""] if p]
+                    cap_suffix = " و ".join(cap_parts) if cap_parts else "اصلاح‌شده"
                     await context.bot.send_document(
                         chat_id=cust_chat_id,
                         document=io.BytesIO(disc_pdf),
-                        filename=f"پیش‌فاکتور تخفیف‌دار سفارش {order_data['customer_title']}.pdf",
-                        caption=f"🎁 **نسخه جدید پیش‌فاکتور شما با اعمال {discount_label} توسط مدیریت**",
+                        filename=f"پیش‌فاکتور جدید سفارش {order_data['customer_title']}.pdf",
+                        caption=f"📄 **نسخه جدید پیش‌فاکتور شما ({cap_suffix}) تاییدشده توسط مدیریت**",
                         parse_mode="Markdown",
                     )
                 except Exception as e_pdf:
-                    logger.warning(f"Could not send discounted PDF to customer: {e_pdf}")
+                    logger.warning(f"Could not send updated PDF to customer: {e_pdf}")
 
+            if discount_amount > 0:
                 price_summary = (
-                    f"💵 **مبلغ اولیه پیش‌فاکتور:** `{to_fa_num(subtotal, comma=True)} ریال`\n"
+                    f"💵 **مبلغ قبل از تخفیف:** `{to_fa_num(subtotal, comma=True)} ریال`\n"
                     f"🎁 **{discount_label} مدیریت:** `{to_fa_num(discount_amount, comma=True)} ریال`\n"
                     f"💰 **مبلغ نهایی قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`"
                 )
@@ -4287,6 +4305,41 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ۷. دکمه‌های پنل مدیریت (مهندس شروین اکبری - ID: 84838606) شامل اعمال تخفیف درصدی و مبلغی دلخواه
+    if data.startswith("adm_switch_mode:"):
+        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+            await query.answer("⛔ فقط مدیر سیستم مجاز است.", show_alert=True)
+            return
+        _, oid, target_mode = data.split(":")
+        ord_rec = ACTIVE_PAYMENT_ORDERS.get(oid)
+        if not ord_rec:
+            await query.message.reply_text("⚠️ این سفارش در حافظه یافت نشد.")
+            return
+        ADMIN_STATE.pop(chat_id, None)
+        order_data = ord_rec["order_data"]
+        order_data["order_mode"] = target_mode
+        order_data["force_wholesale"] = (target_mode == "wholesale")
+        order_data["admin_modified_pricing"] = True
+        order_data["doc_type"] = "پیش‌فاکتور"
+        if target_mode == "wholesale":
+            order_data["warnings"] = [
+                w for w in order_data.get("warnings", [])
+                if "حداقل خرید عمده" not in w and "سفارش عمده محسوب" not in w and "حداقل استاندارد خرید عمده" not in w
+            ]
+        apply_order_mode_pricing_to_items(order_data["items"], order_mode=target_mode)
+        mode_fa = "سفارش عمده" if target_mode == "wholesale" else "سفارش خرد"
+        await query.answer(f"✅ پیش‌فاکتور با قیمت «{mode_fa}» مجدداً محاسبه شد.")
+        pdf_bytes = generate_pdf_bytes(order_data)
+        cust = order_data["customer_title"]
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=io.BytesIO(pdf_bytes),
+            filename=f"پیش‌فاکتور ({mode_fa}) {cust} - کد {oid}.pdf",
+            caption=build_admin_proforma_caption(oid, ord_rec),
+            parse_mode="Markdown",
+            reply_markup=build_admin_proforma_keyboard(oid, order_data),
+        )
+        return
+
     if data.startswith("adm_disc_pct:"):
         if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
             await query.answer("⛔ فقط مدیر سیستم مجاز است.", show_alert=True)
@@ -4425,22 +4478,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         discount_label = fin["discount_label"] or "تخفیف"
         total_payable = fin["total_payable"]
 
-        if discount_amount > 0:
+        if discount_amount > 0 or order_data.get("admin_modified_pricing"):
             try:
                 order_data["doc_type"] = "پیش‌فاکتور"
                 disc_pdf = generate_pdf_bytes(order_data)
+                mode_note = "با قیمت عمده" if order_data.get("order_mode") == "wholesale" and order_data.get("admin_modified_pricing") else ""
+                cap_parts = [p for p in [mode_note, f"با اعمال {discount_label}" if discount_amount > 0 else ""] if p]
+                cap_suffix = " و ".join(cap_parts) if cap_parts else "اصلاح‌شده"
                 await context.bot.send_document(
                     chat_id=cust_chat_id,
                     document=io.BytesIO(disc_pdf),
-                    filename=f"پیش‌فاکتور تخفیف‌دار سفارش {order_data['customer_title']}.pdf",
-                    caption=f"🎁 **پیش‌فاکتور اصلاح‌شده شما با اعمال {discount_label} توسط مدیریت**",
+                    filename=f"پیش‌فاکتور جدید سفارش {order_data['customer_title']}.pdf",
+                    caption=f"📄 **پیش‌فاکتور اصلاح‌شده شما ({cap_suffix}) توسط مدیریت**",
                     parse_mode="Markdown",
                 )
             except Exception as e_pdf:
-                logger.warning(f"Could not send discounted PDF to customer: {e_pdf}")
+                logger.warning(f"Could not send updated PDF to customer: {e_pdf}")
 
+        if discount_amount > 0:
             price_summary = (
-                f"💵 **مبلغ اولیه پیش‌فاکتور:** `{to_fa_num(subtotal, comma=True)} ریال`\n"
+                f"💵 **مبلغ قبل از تخفیف:** `{to_fa_num(subtotal, comma=True)} ریال`\n"
                 f"🎁 **{discount_label} مدیریت:** `{to_fa_num(discount_amount, comma=True)} ریال`\n"
                 f"💰 **مبلغ نهایی قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`"
             )
