@@ -10,6 +10,7 @@
 """
 
 import os
+import math
 import io
 import re
 import json
@@ -22,7 +23,7 @@ import shutil
 import requests
 import openpyxl
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -57,6 +58,11 @@ PAYMENT_BANK_INFO = os.getenv(
 
 # مسیر فایل اکسل لیست قیمت (می‌توانید فایل اکسل جدید را مستقیم در تلگرام هم برای ربات بفرستید)
 EXCEL_FILE_PATH = os.getenv("EXCEL_FILE_PATH", "New Microsoft Excel Worksheet.xlsx")
+
+# تصاویر خوش‌آمدگویی لنت‌ها (می‌توانید در تلگرام عکس را با کپشن /addwelcome بفرستید،
+# یا file_id / لینک / نام فایل عکس‌ها را با کاما در متغیر محیطی WELCOME_PHOTOS قرار دهید)
+WELCOME_PHOTOS_ENV = os.getenv("WELCOME_PHOTOS", "").strip()
+RUNTIME_WELCOME_PHOTOS = [p.strip() for p in WELCOME_PHOTOS_ENV.split(",") if p.strip()]
 
 # لیست مدل‌های رایگان فعال در OpenRouter (حذف مدل‌های قدیمی 404 و اولویت با روتر هوشمند رایگان و مدل‌های فعال)
 FREE_TEXT_MODELS_PRIMARY = [
@@ -200,6 +206,213 @@ def get_compatible_vehicles_for_item(row_id: str, part_name: str = "") -> str:
     except Exception:
         pass
     return "مطابق کاتالوگ رسمی شرکت کیالنت البرز نور"
+
+
+# ==============================================================================
+# ۳.۵ بانک اطلاعات «تعداد در جعبه کیا» (ظرفیت کارتن هر لنت) مطابق فایل اکسل شرکت
+# - لنت‌های جلو پراید، پیکان، پژو ۴۰۵، رنو ال۹۰ و تمامی لنت‌های عقب دیسکی: ۱۶ دست در هر کارتن کیا
+# - لنت جلو هایما S7: ۱۰ دست در هر کارتن کیا
+# - سایر لنت‌های جلو دیسکی (سمند ملی، تیبا/ریو، ۲۰۶، رانا، زانتیا، مگان، ماکسیما، شاسی‌بلندها و...): ۱۲ دست در هر کارتن کیا
+# ==============================================================================
+ROW_BASE_BOX_QTY_MAP = {
+    1: 16,   # جلو پراید (kia-100)
+    2: 16,   # جلو پیکان (kia-101)
+    3: 16,   # جلو پژو ۴۰۵ (kia-102)
+    4: 16,   # جلو رنو L90 (kia-103)
+    5: 12,   # جلو سمند ملی (kia-104)
+    6: 16,   # عقب دنا (kia-504)
+    7: 12,   # جلو تیبا/ریو (kia-105)
+    8: 12,   # جلو پژو ۲۰۶ تیپ ۲ (kia-106)
+    9: 12,   # جلو پژو ۲۰۶ تیپ ۵ (kia-107)
+    10: 16,  # عقب پژو ۲۰۶ تیپ ۵ (kia-507)
+    11: 12,  # جلو رانا (kia-108)
+    12: 16,  # عقب رانا (kia-508)
+    13: 12,  # جلو مزدا وانت (kia-121)
+    14: 12,  # جلو نیسان دیزل (kia-120)
+    15: 12,  # جلو زانتیا ۲۰۰۰ (kia-110)
+    16: 16,  # عقب زانتیا ۲۰۰۰ (kia-510)
+    17: 12,  # جلو مگان ۲۰۰۰ (kia-111)
+    18: 16,  # عقب مگان / پارس ELX (kia-511-S)
+    19: 12,  # جلو ماکسیما (kia-114)
+    20: 16,  # عقب ماکسیما (kia-514)
+    21: 12,  # جلو نیسان پیکاپ/رونیز (kia-122)
+    22: 12,  # جلو نیسان پاترول (kia-123)
+    23: 12,  # جلو ون دلیکا (kia-125)
+    24: 12,  # جلو وانت کاپرا (kia-124)
+    25: 12,  # جلو برلیانس H220/H230 (kia-113)
+    26: 12,  # جلو برلیانس H320/H330 (kia-112)
+    27: 16,  # عقب برلیانس H320/H330 (kia-511-N)
+    28: 12,  # جلو جک J5 (kia-132)
+    29: 16,  # عقب جک J5 (kia-532)
+    30: 12,  # جلو جک S3 (kia-130)
+    31: 12,  # جلو جک S5 (kia-131)
+    32: 16,  # عقب جک S5 دنده‌ای (kia-531MT)
+    33: 16,  # عقب جک S5 اتومات (kia-531AT)
+    34: 12,  # جلو شاهین/آریو (kia-133)
+    35: 16,  # عقب شاهین (kia-533)
+    36: 12,  # جلو هایما S5 (kia-140)
+    37: 10,  # جلو هایما S7 (kia-141) -> ۱۰ دست در جعبه کیا
+    38: 12,  # جلو MVM X33 (kia-150)
+    39: 16,  # عقب تویوتا RAV4 / MVM X33 (kia-550)
+    40: 12,  # جلو تیگو ۵ (kia-151)
+    41: 16,  # عقب تیگو ۵ (kia-551)
+    42: 12,  # جلو تیگو ۷ نوع ۲ (kia-152)
+    43: 16,  # عقب تیگو ۷ ترمز پارک برقی (kia-552-NE)
+    44: 12,  # جلو تیگو ۸ پرومکس (kia-153)
+    45: 12,  # جلو آریزو 6 GT اکسلنت (kia-154)
+    46: 12,  # جلو آریزو 8 اکسلنت (kia-155)
+    47: 16,  # عقب کوپا ریگان (kia-556)
+    48: 12,  # جلو لاماری ایما (kia-157)
+    49: 16,  # عقب KMC K7 / لاماری ایما (kia-557)
+    50: 12,  # جلو تویوتا کرولا ۲۰۰۸ (kia-160)
+    51: 16,  # عقب تویوتا کمری ۲۰۰۷ (kia-561)
+    52: 12,  # جلو تویوتا پرادو / KMC T8 (kia-162)
+    53: 16,  # عقب KMC T8
+    54: 12,  # جلو تویوتا RAV4 (kia-163)
+    55: 12,  # جلو هیوندای آزرا و سوناتا ۲۰۰۷ (kia-170)
+    56: 16,  # عقب هیوندای سوناتا ۲۰۰۷ (kia-570)
+    57: 12,  # جلو سوناتا YF (kia-171)
+    58: 12,  # جلو سراتو سایپایی (kia-172)
+    59: 12,  # جلو سراتو وارداتی (kia-173)
+    60: 12,  # جلو رنو تالیسمان (kia-174)
+    61: 12,  # جلو مزدا ۳
+}
+
+
+def get_box_qty_for_item(row_id: str, part_name: str = "") -> int:
+    """
+    دریافت «تعداد در جعبه کیا» (تعداد دست در هر کارتن) برای هر لنت:
+    ۱. ابتدا از جدول دقیق ردیف‌های پایه اکسل (ROW_BASE_BOX_QTY_MAP) می‌خواند.
+    ۲. اگر ردیف جدیدی اضافه شده بود، بر اساس نام قطعه (هایما S7 -> ۱۰، پراید/پیکان/۴۰۵/ال۹۰ و تمام لنت‌های عقب -> ۱۶، سایر لنت‌های جلو -> ۱۲) تشخیص می‌دهد.
+    """
+    try:
+        s_clean = to_en_str(str(row_id).strip()).split("_")[0]
+        m = re.match(r"^(\d+)", s_clean)
+        base_row = int(m.group(1)) if m else int(float(s_clean))
+        if base_row in ROW_BASE_BOX_QTY_MAP:
+            return ROW_BASE_BOX_QTY_MAP[base_row]
+    except Exception:
+        pass
+
+    name_norm = (part_name or "").strip()
+    if "هایما" in name_norm and ("S7" in name_norm.upper() or "اس ۷" in name_norm or "اس 7" in name_norm):
+        return 10
+    if "عقب" in name_norm or any(k in name_norm for k in ["پراید", "پیکان", "405", "۴۰۵", "L90", "ال ۹۰", "ال 90"]):
+        return 16
+    return 12
+
+
+def format_float_fa(val: float) -> str:
+    """نمایش تمیز عدد اعشاری به فارسی (مثلاً 2.0 -> ۲ و 2.5 -> ۲.۵ و 1.25 -> ۱.۲۵)"""
+    rounded = round(float(val), 2)
+    if abs(rounded - round(rounded)) < 1e-6:
+        return to_fa_num(int(round(rounded)))
+    s = f"{rounded:.2f}".rstrip("0").rstrip(".")
+    return to_fa_num(s).replace(".", "٫")
+
+
+def format_item_carton_info(qty: int, box_qty: int) -> str:
+    """تولید توضیح تعداد کارتن برای یک ردیف لنت"""
+    qty = max(0, int(qty))
+    box_qty = max(1, int(box_qty))
+    full_c = qty // box_qty
+    rem_s = qty % box_qty
+    exact_c = qty / box_qty
+
+    if full_c > 0 and rem_s == 0:
+        return f"{to_fa_num(full_c)} کارتن کامل ({to_fa_num(box_qty)}تایی)"
+    elif full_c > 0 and rem_s > 0:
+        return f"{to_fa_num(full_c)} کارتن + {to_fa_num(rem_s)} دست (معادل {format_float_fa(exact_c)} کارتن {to_fa_num(box_qty)}تایی)"
+    else:
+        return f"{to_fa_num(rem_s)} دست از کارتن {to_fa_num(box_qty)}تایی (معادل {format_float_fa(exact_c)} کارتن)"
+
+
+def calculate_order_cartons(items: list) -> dict:
+    """
+    الگوریتم محاسبه دقیق تعداد کارتن کل سفارش بر اساس «تعداد در جعبه کیا» برای هر لنت:
+    - برای هر ردیف i با تعداد دست q_i و ظرفیت جعبه B_i (۱۶، ۱۲ یا ۱۰ دست):
+      * تعداد کارتن کامل تک‌مدل: full_i = q_i // B_i
+      * تعداد دست باقی‌مانده (کسری): rem_i = q_i % B_i
+      * سهم کسری از یک کارتن: rem_ratio_i = rem_i / B_i
+      * معادل دقیق کارتن ردیف: exact_i = q_i / B_i
+    - در کل سفارش:
+      * جمع کل دست‌ها: total_sets = sum(q_i)
+      * معادل دقیق کارتن کل سفارش: total_exact_cartons = sum(q_i / B_i)
+      * مجموع کارتن‌های کامل تک‌مدل: total_full_cartons = sum(q_i // B_i)
+      * مجموع دست‌های کسری: total_rem_sets = sum(q_i % B_i)
+      * تعداد کارتن ترکیبی مورد نیاز برای دست‌های کسری: mixed_cartons = ceil(sum((q_i % B_i) / B_i))
+      * کل کارتن فیزیکی مورد نیاز جهت بسته‌بندی: total_physical_cartons = total_full_cartons + mixed_cartons
+    """
+    total_sets = 0
+    total_full_cartons = 0
+    total_rem_sets = 0
+    rem_volume_ratio = 0.0
+    total_exact_cartons = 0.0
+    per_item_details = []
+
+    for it in items:
+        q = max(0, int(it.get("qty", 0)))
+        b = int(it.get("box_qty") or get_box_qty_for_item(it.get("row_id", ""), it.get("base_name", it.get("name", ""))))
+        b = max(1, b)
+        it["box_qty"] = b
+
+        full_c = q // b
+        rem_s = q % b
+        exact_c = q / b
+
+        total_sets += q
+        total_full_cartons += full_c
+        total_rem_sets += rem_s
+        rem_volume_ratio += (rem_s / b)
+        total_exact_cartons += exact_c
+
+        per_item_details.append({
+            "row_id": it.get("row_id"),
+            "name": it.get("base_name", it.get("name", "")),
+            "qty": q,
+            "box_qty": b,
+            "full_cartons": full_c,
+            "rem_sets": rem_s,
+            "exact_cartons": exact_c,
+            "carton_label": format_item_carton_info(q, b),
+        })
+
+    mixed_cartons = int(math.ceil(round(rem_volume_ratio, 6))) if total_rem_sets > 0 else 0
+    total_physical_cartons = total_full_cartons + mixed_cartons
+    exact_str = format_float_fa(total_exact_cartons)
+
+    if total_sets == 0:
+        summary_short = "۰ کارتن"
+        summary_full = "۰ کارتن"
+    elif total_rem_sets == 0:
+        summary_short = f"{to_fa_num(total_full_cartons)} کارتن کامل"
+        summary_full = f"{to_fa_num(total_full_cartons)} کارتن کامل"
+    elif total_full_cartons > 0:
+        summary_short = f"معادل {exact_str} کارتن ({to_fa_num(total_full_cartons)} کارتن کامل + {to_fa_num(total_rem_sets)} دست کسری)"
+        summary_full = (
+            f"معادل {exact_str} کارتن "
+            f"({to_fa_num(total_full_cartons)} کارتن کامل + {to_fa_num(total_rem_sets)} دست کسری ≈ "
+            f"{to_fa_num(total_physical_cartons)} کارتن بسته‌بندی)"
+        )
+    else:
+        summary_short = f"معادل {exact_str} کارتن ({to_fa_num(total_rem_sets)} دست در {to_fa_num(total_physical_cartons)} کارتن)"
+        summary_full = (
+            f"معادل {exact_str} کارتن "
+            f"({to_fa_num(total_rem_sets)} دست کسری ≈ {to_fa_num(total_physical_cartons)} کارتن بسته‌بندی)"
+        )
+
+    return {
+        "total_sets": total_sets,
+        "total_exact_cartons": round(total_exact_cartons, 2),
+        "total_exact_cartons_fa": exact_str,
+        "total_full_cartons": total_full_cartons,
+        "total_rem_sets": total_rem_sets,
+        "mixed_cartons": mixed_cartons,
+        "total_physical_cartons": total_physical_cartons,
+        "summary_short": summary_short,
+        "summary_full": summary_full,
+        "items": per_item_details,
+    }
 
 
 # ردیف‌های پایه خودروهای ایرانی (افزایش ۱۰٪ در سفارش خرد):
@@ -395,6 +608,8 @@ def normalize_automotive_stt_text(text: str) -> str:
         (r"\bبی\s*شیم\b", "بدون شیم"),
         (r"\bبی‌شیم\b", "بدون شیم"),
         # اصلاح نام خودروها و ضخامت‌ها در گفتار
+        (r"\bلنتا\b", "لنت ها"),
+        (r"\bلنتای\b", "لنت های"),
         (r"\bپرایدی\b", "پراید"),
         (r"\bتیبایی\b", "تیبا"),
         (r"\bپژویی\b", "پژو"),
@@ -598,25 +813,41 @@ def load_catalog_from_excel(excel_path: str):
         p_no = parse_price(price_no_shim)
         p_yes = parse_price(price_with_shim)
 
+        r_id_str = str(row_id).strip()
+        name_str = str(name).strip()
+        box_q = get_box_qty_for_item(r_id_str, name_str)
+        # اگر در ستون هفتم اکسل هم عددی برای تعداد در جعبه وارد شده باشد، از آن استفاده می‌کند
+        if ws.max_column >= 7:
+            raw_bq = ws.cell(r, 7).value
+            if raw_bq is not None:
+                try:
+                    parsed_bq = int(float(to_en_str(str(raw_bq)).strip()))
+                    if 1 <= parsed_bq <= 100:
+                        box_q = parsed_bq
+                except Exception:
+                    pass
+
         catalog.append(
             {
-                "row_id": str(row_id).strip(),
+                "row_id": r_id_str,
                 "wva": str(wva).strip(),
-                "name": str(name).strip(),
+                "name": name_str,
                 "price_no_shim": p_no,
                 "price_with_shim": p_yes,
+                "box_qty": box_q,
             }
         )
     return catalog
 
 
 def format_catalog_for_prompt(catalog) -> str:
-    lines = ["ردیف | کد فنی (WVA) | نام قطعه خودرو | قیمت بدون شیم (ریال) | قیمت با شیم (ریال)"]
+    lines = ["ردیف | کد فنی (WVA) | نام قطعه خودرو | تعداد در کارتن کیا (دست) | قیمت بدون شیم (ریال) | قیمت با شیم (ریال)"]
     for item in catalog:
         p_no = f"{item['price_no_shim']:,}" if item["price_no_shim"] else "ناموجود"
         p_yes = f"{item['price_with_shim']:,}" if item["price_with_shim"] else "ناموجود"
+        bq = item.get("box_qty") or get_box_qty_for_item(item["row_id"], item["name"])
         lines.append(
-            f"{item['row_id']} | {item['wva']} | {item['name']} | {p_no} | {p_yes}"
+            f"{item['row_id']} | {item['wva']} | {item['name']} | {bq} دست | {p_no} | {p_yes}"
         )
     return "\n".join(lines)
 
@@ -649,6 +880,9 @@ def build_system_prompt(catalog: list) -> str:
    - برای هر قلم سفارش، شماره ردیف دقیق (`row_id`) را از روی **نام قطعه خودرو** در لیست بالا پیدا کنید.
    - اگر کالا دو ضخامت ۵ میل و ۶ میل دارد (مثل تیبا/ریو ۷.۱ و ۷.۲، کوییک/ساینا، رانا و شاهین) و کاربر ضخامت را ذکر کرد (مثلاً «۶ میل» یا «۵ میل»)، حتماً ردیف دقیق همان ضخامت (مثلاً `7.2` برای تیبا/ریو ۶ میل) را انتخاب کنید.
    - وضعیت شیم (`with_shim`): برای **هر قلم کالا به صورت جداگانه** بررسی کنید! اگر برای آن کالا عبارت «با شیم»، «باشیم»، «شیم‌دار» یا «با سیم» ذکر شده بود حتماً `with_shim` را `true` بگذارید؛ و اگر «بدون شیم»، «بدون سیم» یا «بی‌شیم» ذکر شده بود `false` بگذارید.
+   - **محاسبه دقیق تعداد بر اساس «دست» یا «کارتن/جعبه»:**
+     • اگر کاربر تعداد را به «دست»، «تا» یا «عدد» گفت (مثلاً «۵ دست پراید»)، مقدار `"order_unit": "set"` و `"qty": 5` بگذارید.
+     • اگر کاربر تعداد را به «کارتن» یا «جعبه» گفت (مثلاً «۲ کارتن پراید» یا «۳ کارتن سمند»)، حتماً مقدار `"order_unit": "carton"` و `"carton_count"` را برابر تعداد کارتن درخواستی بگذارید و `"qty"` را برابر `carton_count × تعداد در کارتن کیا` برای همان ردیف قرار دهید (مثلاً برای ۲ کارتن پراید که ۱۶تایی است `qty: 32` و برای ۳ کارتن سمند که ۱۲تایی است `qty: 36` و برای ۱ کارتن هایما S7 که ۱۰تایی است `qty: 10`).
    - نام نمایشی کالا در جدول (`display_name`): اگر `with_shim` برابر `true` است عبارت `با شیم` را در انتهای نام قطعه اضافه کنید (مگر اینکه کاربر صراحتاً بدون شیم خواسته باشد).
 6. خروجی شما باید **فقط و فقط یک JSON معتبر** بدون هیچ توضیح اضافه‌ای باشد با ساختار زیر:
 {{
@@ -663,6 +897,8 @@ def build_system_prompt(catalog: list) -> str:
       "row_id": "30",
       "wva": "WVA 80176",
       "display_name": "لنت ترمز جلو دیسکی جک S3 با شیم",
+      "order_unit": "set",
+      "carton_count": 0,
       "qty": 1,
       "with_shim": true
     }}
@@ -882,23 +1118,24 @@ def call_openrouter_models(
 def format_full_catalog_with_compatibility(catalog: list, order_mode: str = "wholesale", show_prices: bool = False) -> str:
     """
     آماده‌سازی بانک اطلاعات کامل محصولات کیالنت البرز نور شامل:
-    ردیف، کد فنی، نام قطعه و لیست کامل خودروهای سازگار (اشتراکات).
+    ردیف، کد فنی، نام قطعه، تعداد در کارتن کیا و لیست کامل خودروهای سازگار (اشتراکات).
     در حالت سفارش عمده تا قبل از صدور پیش‌فاکتور، قیمت‌ها نمایش داده نمی‌شوند.
     """
     if order_mode == "wholesale" and not show_prices:
         lines = [
-            "ردیف | کد فنی | نام لنت تولیدی کیالنت البرز نور | وضعیت موجودی | خودروهای سازگار و مشترک (اشتراکات)"
+            "ردیف | کد فنی | نام لنت تولیدی کیالنت البرز نور | تعداد در کارتن کیا | وضعیت موجودی | خودروهای سازگار و مشترک (اشتراکات)"
         ]
         for item in catalog:
             avail = "موجود" if (item["price_no_shim"] or item["price_with_shim"]) else "ناموجود"
+            bq = item.get("box_qty") or get_box_qty_for_item(item["row_id"], item["name"])
             compat = get_compatible_vehicles_for_item(item["row_id"], item["name"])
             lines.append(
-                f"{item['row_id']} | {item['wva']} | {item['name']} | {avail} | {compat}"
+                f"{item['row_id']} | {item['wva']} | {item['name']} | {bq} دست | {avail} | {compat}"
             )
         return "\n".join(lines)
 
     lines = [
-        "ردیف | کد فنی | نام لنت تولیدی کیالنت البرز نور | قیمت بدون شیم (ریال) | قیمت با شیم (ریال) | خودروهای سازگار و مشترک (اشتراکات)"
+        "ردیف | کد فنی | نام لنت تولیدی کیالنت البرز نور | تعداد در کارتن کیا | قیمت بدون شیم (ریال) | قیمت با شیم (ریال) | خودروهای سازگار و مشترک (اشتراکات)"
     ]
     for item in catalog:
         p_no_base = item["price_no_shim"]
@@ -908,9 +1145,10 @@ def format_full_catalog_with_compatibility(catalog: list, order_mode: str = "who
 
         p_no_str = f"{p_no_final:,}" if p_no_final else "ناموجود"
         p_yes_str = f"{p_yes_final:,}" if p_yes_final else "ناموجود"
+        bq = item.get("box_qty") or get_box_qty_for_item(item["row_id"], item["name"])
         compat = get_compatible_vehicles_for_item(item["row_id"], item["name"])
         lines.append(
-            f"{item['row_id']} | {item['wva']} | {item['name']} | {p_no_str} | {p_yes_str} | {compat}"
+            f"{item['row_id']} | {item['wva']} | {item['name']} | {bq} دست | {p_no_str} | {p_yes_str} | {compat}"
         )
     return "\n".join(lines)
 
@@ -933,7 +1171,6 @@ def answer_catalog_question(user_question: str, catalog: list, order_mode: str =
 - حداقل خرید عمده: ۲ کارتن یا معادل ۲۰ دست لنت می‌باشد (سفارش‌های کمتر از ۱۵ دست، سفارش عمده محسوب نمی‌شوند و به سفارش خرد منتقل می‌شوند).
 - نحوه تسویه: تمامی سفارشات به صورت نقدی تسویه می‌شوند.
 - قیمت‌های سفارش عمده تا قبل از ثبت سفارش و صدور پیش‌فاکتور رسمی نمایش داده نمی‌شود؛ اگر مشتری در حالت عمده قیمت تک‌تک لنت‌ها را پرسید، محترمانه بگویید که کافی است لیست سفارش خود را بفرستد تا پیش‌فاکتور رسمی با قیمت روز برایش صادر شود.
-- هرگز درباره درصد تفاوت قیمت خرد و عمده صحبت نکنید.
 - اگر مشتری پرسید «چه لنت‌هایی دارید؟»، دسته‌بندی کامل لنت‌های تولیدی ما (ایرانی، چینی، شاسی‌بلند و وارداتی) را به صورت مرتب و خوانا معرفی کنید.
 - اگر مشتری پرسید «لنت فلان ماشین به چه ماشین‌هایی می‌خورد؟» یا «برای فلان ماشین چه لنتی دارید و با چی مشترکه؟»، دقیقاً از ستون «خودروهای سازگار و مشترک (اشتراکات)» در جدول بالا استفاده کنید و کد فنی و تمام خودروهای مشترک آن را کامل بنویسید.
 - پاسخ را با فرمت زیبا، بولت‌بندی شده و اعداد فارسی بنویسید."""
@@ -967,7 +1204,15 @@ def answer_catalog_question(user_question: str, catalog: list, order_mode: str =
                 else:
                     ans = _call_google_ai_studio_single(messages, model_name, temperature=0.2, json_mode=False)
                 if ans and ans.strip():
-                    return ans.strip()
+                    cleaned_ans = re.sub(r"<think>.*?</think>", "", ans, flags=re.DOTALL).strip()
+                    # حذف خطوط متا یا تفکر انگلیسی در صورت نشت از مدل‌های استدلالی رایگان
+                    cleaned_lines = [
+                        ln for ln in cleaned_ans.splitlines()
+                        if not ln.strip().lower().startswith(("textwe should", "we should not", "thinking process:", "let's analyze"))
+                    ]
+                    cleaned_ans = "\n".join(cleaned_lines).strip()
+                    if cleaned_ans and re.search(r"[آ-ی]", cleaned_ans):
+                        return cleaned_ans
             except Exception as e:
                 last_error = str(e)
                 continue
@@ -979,23 +1224,36 @@ def is_question_or_catalog_inquiry(text: str) -> bool:
     """
     تشخیص هوشمند اینکه پیام کاربر یک «سوال فنی / استعلام اشتراکات / موجودی لنت‌ها» است یا یک «سفارش صدور فاکتور»
     """
-    t = (text or "").strip()
+    t = normalize_automotive_stt_text(text or "")
     if not t:
         return False
 
-    # اگر صراحتاً کلمه فاکتور یا پیش‌فاکتور همراه با تعداد/سفارش آمده باشد، سفارش است مگر سوالی باشد
+    en_t = to_en_str(t)
+
+    # ۱. اگر پیام الگوی سفارش همه لنت‌ها («از همه»، «همه لنت»، «کل لیست») دارد و علامت سوال ندارد، قطعاً سفارش است
+    all_order_patterns = [
+        r"از\s+همه", r"همه\s*لنت", r"تمام\s*لنت", r"تمامی\s*لنت", r"کل\s*لنت", r"کل\s*لیست", r"از\s+هر\s*کدوم", r"از\s+هر\s*کدام"
+    ]
+    if any(re.search(p, t) for p in all_order_patterns) and "؟" not in t and "?" not in t:
+        return False
+
+    # ۲. اگر پیام شامل عدد + واحد سفارش (دست / کارتن / تا / عدد) است و علامت سوال یا کلمه «حداقل/چند/شرایط» ندارد، قطعاً سفارش است
+    if re.search(r"\d+\s*(?:کارتن|دست|تا|عدد)", en_t) and "؟" not in t and "?" not in t:
+        if not any(q_w in t for q_w in ["چند", "حداقل", "شرایط", "کدوم", "کدام", "چی میخوره", "میخوره", "مشترک"]):
+            return False
+
+    # ۳. اگر صراحتاً کلمه فاکتور یا پیش‌فاکتور همراه با سفارش آمده باشد، سفارش است
     order_triggers = ["فاکتور کن", "پیش فاکتور کن", "پیش‌فاکتور کن", "فاکتور بزن", "سفارش خانم", "سفارش آقای", "سفارش اقای"]
     if any(tr in t for tr in order_triggers) and "؟" not in t and "چی میخوره" not in t and "مشترک" not in t:
         return False
 
     qa_keywords = [
         "؟", "?", "اشتراک", "مشترک", "میخوره", "می‌خوره", "میخورد", "می‌خورد",
-        "کدوم لنت", "کدام لنت", "چه لنت", "لنت چی", "لنت های", "لنت‌های",
-        "لیست لنت", "سوال", "بپرسم", "شرایط خرید", "حداقل خرید", "چند دست",
-        "کارتن", "سازگار", "معادل", "به چی میخوره", "به چه ماشینی", "دارید", "دارین",
+        "کدوم لنت", "کدام لنت", "چه لنت", "لنت چی",
+        "لیست لنت", "سوال", "بپرسم", "شرایط خرید", "حداقل خرید", "چند دست", "چند کارتن",
+        "سازگار", "معادل", "به چی میخوره", "به چه ماشینی", "دارید", "دارین",
     ]
     if any(kw in t for kw in qa_keywords):
-        # بررسی کنیم اگر پیام حاوی الگوی سفارش چند قلمه نیست، سوال تلقی شود
         if not any(tr in t for tr in order_triggers):
             return True
     return False
@@ -1037,13 +1295,12 @@ def _try_parse_all_items_shortcut(cleaned_text: str, catalog: list, order_mode: 
         if w_str in t:
             qty = w_val
             break
-    m_digit = re.search(r"(\d+)\s*(?:دست|تا|عدد|کارتن)?", en_t)
+    is_carton_order = ("کارتن" in t or "جعبه" in t)
+    m_digit = re.search(r"(\d+)\s*(?:دست|تا|عدد|کارتن|جعبه)?", en_t)
     if m_digit:
         val = int(m_digit.group(1))
-        if 1 <= val <= 500:
+        if 1 <= val <= 10000:
             qty = val
-            if "کارتن" in t:
-                qty = val * 10
 
     want_shim = True
     if "بدون شیم" in t:
@@ -1073,12 +1330,16 @@ def _try_parse_all_items_shortcut(cleaned_text: str, catalog: list, order_mode: 
             use_shim = False
         elif (not use_shim) and c["price_no_shim"] is None:
             use_shim = True
+        bq = c.get("box_qty") or get_box_qty_for_item(c["row_id"], c["name"])
+        item_qty = (qty * bq) if is_carton_order else qty
         items_raw.append(
             {
                 "row_id": c["row_id"],
                 "wva": c["wva"],
                 "display_name": c["name"] + (" با شیم" if use_shim and "شیم" not in c["name"] else ""),
-                "qty": qty,
+                "order_unit": "carton" if is_carton_order else "set",
+                "carton_count": qty if is_carton_order else 0,
+                "qty": item_qty,
                 "with_shim": use_shim,
             }
         )
@@ -1273,12 +1534,14 @@ def build_single_verified_item(matched: dict, qty: int, with_shim: bool, order_m
     if with_shim and "شیم" not in display_name:
         display_name += " با شیم"
 
+    box_q = matched.get("box_qty") or get_box_qty_for_item(matched["row_id"], matched["name"])
     return {
         "row_id": matched["row_id"],
         "wva": matched["wva"],
         "name": display_name,
         "base_name": matched["name"],
         "qty": max(1, int(qty)),
+        "box_qty": box_q,
         "base_unit_price": base_unit_price,
         "unit_price": final_unit_price,
         "markup_percent": markup_pct,
@@ -1320,7 +1583,7 @@ def validate_and_price_order(parsed: dict, catalog: list, source_text: str = "",
     for it in parsed.get("items", []):
         row_id = str(it.get("row_id", "")).strip()
         wva = str(it.get("wva", "")).strip().upper()
-        qty = int(it.get("qty", 1))
+        qty = int(float(it.get("qty", 1) or 1))
         with_shim = bool(it.get("with_shim", False))
 
         matched = by_row.get(row_id)
@@ -1330,6 +1593,17 @@ def validate_and_price_order(parsed: dict, catalog: list, source_text: str = "",
         if not matched:
             warnings.append(f"کالای «{it.get('display_name', wva)}» در لیست اکسل یافت نشد.")
             continue
+
+        box_q = matched.get("box_qty") or get_box_qty_for_item(matched["row_id"], matched["name"])
+        order_unit = str(it.get("order_unit", "")).lower().strip()
+        carton_count = it.get("carton_count", 0)
+        if order_unit in ("carton", "box", "کارتن", "جعبه"):
+            try:
+                c_num = float(carton_count) if carton_count else float(qty)
+                if c_num > 0:
+                    qty = int(round(c_num * box_q))
+            except Exception:
+                pass
 
         base_unit_price = matched["price_with_shim"] if with_shim else matched["price_no_shim"]
         if base_unit_price is None:
@@ -1358,6 +1632,7 @@ def validate_and_price_order(parsed: dict, catalog: list, source_text: str = "",
                 "name": display_name,
                 "base_name": matched["name"],
                 "qty": qty,
+                "box_qty": box_q,
                 "base_unit_price": base_unit_price,
                 "unit_price": final_unit_price,
                 "markup_percent": markup_pct,
@@ -1394,6 +1669,7 @@ def render_invoice_html(
 ) -> str:
     total_payable = sum(item["qty"] * item["unit_price"] for item in items)
     total_qty = sum(item["qty"] for item in items)
+    carton_stats = calculate_order_cartons(items)
     total_words = num_to_persian_words(total_payable) + " ریال"
 
     # ردیف‌های صفحه اول (جدول فاکتور / پیش‌فاکتور)
@@ -1419,10 +1695,12 @@ def render_invoice_html(
         compat_cars = item.get("compatible_cars") or get_compatible_vehicles_for_item(
             item.get("row_id", ""), item.get("name", "")
         )
+        bq = item.get("box_qty") or get_box_qty_for_item(item.get("row_id", ""), item.get("name", ""))
+        item_c_info = format_item_carton_info(item["qty"], bq)
         compat_rows_html += f"""
         <tr style="background-color: {bg};">
             <td class="c-idx">{to_fa_num(idx)}</td>
-            <td class="c-name">{item['name']}</td>
+            <td class="c-name">{item['name']}<br><span style="font-size:8pt;color:#444;">({to_fa_num(item['qty'])} دست = {item_c_info})</span></td>
             <td class="c-wva" dir="ltr">{item['wva']}</td>
             <td class="c-cars">{to_fa_num(compat_cars)}</td>
         </tr>
@@ -1780,6 +2058,10 @@ body {{
         <div class="summary-container">
             <table class="summary-table">
                 <tr>
+                    <td class="sum-label">جمع کل تعداد (بر اساس جعبه کیا)</td>
+                    <td class="sum-amount">{to_fa_num(total_qty)} دست ({carton_stats['summary_short']})</td>
+                </tr>
+                <tr>
                     <td class="sum-label">مبلغ قابل پرداخت</td>
                     <td class="sum-amount">{to_fa_num(total_payable, comma=True)}</td>
                 </tr>
@@ -2056,10 +2338,12 @@ def format_draft_order_summary(order_data: dict, is_vip: bool = False) -> str:
 
     total_payable = sum(it["qty"] * it["unit_price"] for it in items)
     total_qty = sum(it["qty"] for it in items)
+    carton_stats = calculate_order_cartons(items)
     compact_mode = len(items) > 18
 
     footer_lines = [""]
     footer_lines.append(f"📊 **جمع کل تعداد:** `{to_fa_num(total_qty)} دست` ({to_fa_num(len(items))} ردیف کالا)")
+    footer_lines.append(f"📦 **محاسبه تعداد کارتن کیا:** `{carton_stats['summary_full']}`")
     if hide_prices:
         footer_lines.append("💡 _قیمت‌های سفارش عمده پس از تایید اقلام، در فایل «پیش‌فاکتور» درج و نمایش داده می‌شود._")
     else:
@@ -2086,21 +2370,23 @@ def format_draft_order_summary(order_data: dict, is_vip: bool = False) -> str:
     for idx, it in enumerate(items, start=1):
         line_total = it["qty"] * it["unit_price"]
         shim_str = "با شیم" if it.get("with_shim") else "بدون شیم"
+        bq = it.get("box_qty") or get_box_qty_for_item(it.get("row_id", ""), it.get("base_name", ""))
+        c_info = format_item_carton_info(it["qty"], bq)
         if compact_mode:
             if hide_prices:
-                entry = f"{to_fa_num(idx)}. {it['base_name']} ({shim_str}) | **{to_fa_num(it['qty'])} دست**"
+                entry = f"{to_fa_num(idx)}. {it['base_name']} ({shim_str}) | **{to_fa_num(it['qty'])} دست** ({c_info})"
             else:
-                entry = f"{to_fa_num(idx)}. {it['base_name']} ({shim_str}) | **{to_fa_num(it['qty'])} دست** | `{to_fa_num(line_total, comma=True)}`"
+                entry = f"{to_fa_num(idx)}. {it['base_name']} ({shim_str}) | **{to_fa_num(it['qty'])} دست** ({c_info}) | `{to_fa_num(line_total, comma=True)}`"
         else:
             if hide_prices:
                 entry = (
                     f"{to_fa_num(idx)}. **{it['base_name']}** ({shim_str})\n"
-                    f"   🔹 کد فنی: `{it['wva']}` | تعداد: **{to_fa_num(it['qty'])} دست**"
+                    f"   🔹 کد فنی: `{it['wva']}` | تعداد: **{to_fa_num(it['qty'])} دست** (`{c_info}`)"
                 )
             else:
                 entry = (
                     f"{to_fa_num(idx)}. **{it['base_name']}** ({shim_str})\n"
-                    f"   🔹 کد: `{it['wva']}` | تعداد: **{to_fa_num(it['qty'])} دست** | فی: `{to_fa_num(it['unit_price'], comma=True)}` | جمع: `{to_fa_num(line_total, comma=True)} ریال`"
+                    f"   🔹 کد: `{it['wva']}` | تعداد: **{to_fa_num(it['qty'])} دست** (`{c_info}`) | فی: `{to_fa_num(it['unit_price'], comma=True)}` | جمع: `{to_fa_num(line_total, comma=True)} ریال`"
                 )
 
         if used_chars + len(entry) + 2 > max_items_chars:
@@ -2244,15 +2530,18 @@ def format_single_item_edit_text(
             f"\n💰 **جمع این ردیف:** `{to_fa_num(line_total, comma=True)} ریال`"
         )
 
+    bq = item.get("box_qty") or get_box_qty_for_item(item.get("row_id", ""), item.get("base_name", ""))
+    c_info = format_item_carton_info(item["qty"], bq)
     return (
         f"🔧 **ویرایش ردیف {to_fa_num(idx + 1)} از {to_fa_num(total_items)}:**\n\n"
         f"🔹 **نام قطعه:** `{item['base_name']}`\n"
         f"🔹 **کد فنی:** `{item['wva']}`\n"
         f"🔹 **وضعیت شیم:** {shim_str}"
         f"{thickness_note}\n"
-        f"🔹 **تعداد فعلی:** `{to_fa_num(item['qty'])} دست`"
+        f"📦 **تعداد در جعبه کیا:** `{to_fa_num(bq)} دست در هر کارتن`\n"
+        f"🔹 **تعداد فعلی:** `{to_fa_num(item['qty'])} دست` (`{c_info}`)"
         f"{price_block}\n\n"
-        "👇 از دکمه‌های زیر تعداد، وضعیت شیم یا ضخامت کفشک را تغییر دهید:"
+        "👇 از دکمه‌های زیر تعداد (به دست یا کارتن)، وضعیت شیم یا ضخامت کفشک را تغییر دهید:"
     )
 
 
@@ -2264,6 +2553,13 @@ def get_single_item_edit_keyboard(item: dict, idx: int, catalog: list, is_vip: b
             InlineKeyboardButton("➖ ۱", callback_data=f"item_qty:{idx}:-1"),
             InlineKeyboardButton(f"📦 تعداد: {to_fa_num(item['qty'])} دست", callback_data=f"item_custom_qty:{idx}"),
             InlineKeyboardButton("➕ ۱", callback_data=f"item_qty:{idx}:+1"),
+        ]
+    )
+    bq = item.get("box_qty") or get_box_qty_for_item(item.get("row_id", ""), item.get("base_name", ""))
+    rows.append(
+        [
+            InlineKeyboardButton(f"➖ ۱ کارتن (-{to_fa_num(bq)} دست)", callback_data=f"item_qty:{idx}:-{bq}"),
+            InlineKeyboardButton(f"➕ ۱ کارتن (+{to_fa_num(bq)} دست)", callback_data=f"item_qty:{idx}:+{bq}"),
         ]
     )
     rows.append(
@@ -2325,6 +2621,146 @@ def get_single_item_edit_keyboard(item: dict, idx: int, catalog: list, is_vip: b
     return InlineKeyboardMarkup(rows)
 
 
+WELCOME_LOCAL_FILE_ID_CACHE = {}  # کش شدن file_id تلگرام برای عکس‌های آپلودشده در گیت‌هاب جهت ارسال فوری
+
+
+def _natural_sort_key(path_str: str):
+    base = os.path.basename(path_str).lower()
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", base)]
+
+
+def get_configured_welcome_photos() -> list:
+    """
+    دریافت لیست عکس‌های خوش‌آمدگویی (حداکثر ۱۰ عکس برای آلبوم تلگرام):
+    ۱. اولویت با فایل‌های عکسی که کنار کد ربات در GitHub آپلود شده‌اند:
+       - هر عکسی با نام‌های welcome1.jpg، welcome2.jpg، lent1.jpg، pad1.jpg، 1.jpg و... (با پسوندهای jpg, jpeg, png, webp)
+       - یا هر عکسی که داخل پوشه welcome_photos کنار کد ربات قرار داده شود
+       - یا هر فایل عکس (.jpg / .jpeg / .png / .webp) که در ریشه مخزن گیت‌هاب کنار kialent_telegram_bot.py آپلود شده باشد
+    ۲. در صورت نبود فایل محلی، از متغیر محیطی WELCOME_PHOTOS یا عکس‌های اضافه‌شده با /addwelcome استفاده می‌کند.
+    """
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    local_candidates = []
+
+    # الف) بررسی پوشه اختصاصی welcome_photos (اگر کاربر پوشه‌ای به این نام در گیت‌هاب بسازد)
+    welcome_dir = os.path.join(base_dir, "welcome_photos")
+    if os.path.isdir(welcome_dir):
+        for fname in os.listdir(welcome_dir):
+            if fname.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                full_p = os.path.join(welcome_dir, fname)
+                if os.path.isfile(full_p):
+                    local_candidates.append(full_p)
+
+    # ب) بررسی فایل‌های عکس در ریشه مخزن گیت‌هاب (کنار kialent_telegram_bot.py)
+    if not local_candidates:
+        priority_Img = []
+        other_Img = []
+        for fname in os.listdir(base_dir):
+            low = fname.lower()
+            if not low.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                continue
+            full_p = os.path.join(base_dir, fname)
+            if not os.path.isfile(full_p):
+                continue
+            if low.startswith(("welcome", "lent", "pad", "photo", "pic", "aks", "1", "2", "3", "4", "5", "6", "7", "8", "9")):
+                priority_Img.append(full_p)
+            else:
+                other_Img.append(full_p)
+        local_candidates = sorted(priority_Img, key=_natural_sort_key) + sorted(other_Img, key=_natural_sort_key)
+    else:
+        local_candidates.sort(key=_natural_sort_key)
+
+    photos = []
+    for p in local_candidates:
+        if p not in photos:
+            photos.append(p)
+    for p in RUNTIME_WELCOME_PHOTOS:
+        if p not in photos:
+            photos.append(p)
+    return photos[:10]
+
+
+async def send_welcome_photos_if_any(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """ارسال عکس یا آلبوم عکس چند لنت در ابتدای پیام خوش‌آمدگویی (با کش خودکار file_id برای سرعت بالا)"""
+    photos = get_configured_welcome_photos()
+    if not photos:
+        return
+    caption_txt = "✨ **نمونه لنت‌های ترمز دیسکی تولیدی شرکت کیالنت البرز نور**"
+    try:
+        if len(photos) == 1:
+            src = photos[0]
+            cached_id = WELCOME_LOCAL_FILE_ID_CACHE.get(src)
+            if cached_id:
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=cached_id,
+                    caption=caption_txt,
+                    parse_mode="Markdown",
+                )
+            elif os.path.isfile(src):
+                with open(src, "rb") as f:
+                    sent_msg = await context.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=f,
+                        caption=caption_txt,
+                        parse_mode="Markdown",
+                    )
+                    if sent_msg and sent_msg.photo:
+                        WELCOME_LOCAL_FILE_ID_CACHE[src] = sent_msg.photo[-1].file_id
+            else:
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=src,
+                    caption=caption_txt,
+                    parse_mode="Markdown",
+                )
+        else:
+            media_group = []
+            open_files = []
+            uncached_indices = []
+            try:
+                for i, src in enumerate(photos):
+                    cap = caption_txt if i == 0 else None
+                    cached_id = WELCOME_LOCAL_FILE_ID_CACHE.get(src)
+                    if cached_id:
+                        media_group.append(
+                            InputMediaPhoto(media=cached_id, caption=cap, parse_mode="Markdown" if cap else None)
+                        )
+                    elif os.path.isfile(src):
+                        f_obj = open(src, "rb")
+                        open_files.append(f_obj)
+                        uncached_indices.append((i, src))
+                        media_group.append(
+                            InputMediaPhoto(media=f_obj, caption=cap, parse_mode="Markdown" if cap else None)
+                        )
+                    else:
+                        media_group.append(
+                            InputMediaPhoto(media=src, caption=cap, parse_mode="Markdown" if cap else None)
+                        )
+                sent_msgs = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+                if sent_msgs:
+                    for idx_in_group, src_path in uncached_indices:
+                        if idx_in_group < len(sent_msgs) and sent_msgs[idx_in_group].photo:
+                            WELCOME_LOCAL_FILE_ID_CACHE[src_path] = sent_msgs[idx_in_group].photo[-1].file_id
+            finally:
+                for f_obj in open_files:
+                    try:
+                        f_obj.close()
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.warning(f"Could not send welcome photos: {e}")
+
+
+async def clear_welcome_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دستور ویژه مدیر (/clearwelcome) برای پاک کردن عکس‌های خوش‌آمدگویی"""
+    user_id = update.effective_user.id if update.effective_user else 0
+    if user_id != ADMIN_TELEGRAM_ID and not is_user_vip(user_id):
+        await update.message.reply_text("⛔ این دستور فقط مخصوص مدیر سیستم است.")
+        return
+    RUNTIME_WELCOME_PHOTOS.clear()
+    await update.message.reply_text("🗑 لیست عکس‌های خوش‌آمدگویی پاک شد.")
+
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id if update.effective_user else chat_id
@@ -2335,6 +2771,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     AWAITING_VIP_CODE_USERS.discard(chat_id)
     USER_EDIT_STATE.pop(chat_id, None)
     current_mode = get_user_order_mode(chat_id)
+
+    # ارسال عکس لنت‌ها (در صورت تنظیم شدن) در ابتدای خوش‌آمدگویی
+    await send_welcome_photos_if_any(chat_id, context)
 
     welcome = build_welcome_text(user_id=user_id)
     await update.message.reply_text(
@@ -2448,6 +2887,7 @@ async def send_vip_direct_invoice_pdf(
 
     total_payable = sum(i["qty"] * i["unit_price"] for i in order_data["items"])
     total_qty = sum(i["qty"] for i in order_data["items"])
+    carton_stats = calculate_order_cartons(order_data["items"])
     mode_label = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
 
     caption = (
@@ -2455,6 +2895,7 @@ async def send_vip_direct_invoice_pdf(
         f"🏷 نوع سفارش: `{mode_label}`\n"
         f"📅 تاریخ: `{to_fa_num(order_data['date'])}`\n"
         f"📦 تعداد کل: `{to_fa_num(total_qty)}` دست ({to_fa_num(len(order_data['items']))} ردیف)\n"
+        f"📦 معادل کارتن کیا: `{carton_stats['summary_full']}`\n"
         f"💰 مبلغ قابل پرداخت: `{to_fa_num(total_payable, comma=True)} ریال`\n"
         f"📎 پیوست صفحه ۲: `جدول راهنمای کاربرد و اشتراکات لنت‌ها`"
     )
@@ -2571,6 +3012,7 @@ async def send_customer_proforma_pdf(
 
     total_payable = sum(i["qty"] * i["unit_price"] for i in order_data["items"])
     total_qty = sum(i["qty"] for i in order_data["items"])
+    carton_stats = calculate_order_cartons(order_data["items"])
     mode_label = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
 
     ACTIVE_PAYMENT_ORDERS[oid] = {
@@ -2592,6 +3034,7 @@ async def send_customer_proforma_pdf(
         f"🏷 نوع سفارش: `{mode_label}`\n"
         f"📅 تاریخ: `{to_fa_num(order_data['date'])}`\n"
         f"📦 تعداد کل: `{to_fa_num(total_qty)}` دست ({to_fa_num(len(order_data['items']))} ردیف)\n"
+        f"📦 معادل کارتن کیا: `{carton_stats['summary_full']}`\n"
         f"💰 مبلغ قابل پرداخت: `{to_fa_num(total_payable, comma=True)} ریال`\n"
         f"📎 پیوست صفحه ۲: `جدول راهنمای کاربرد و اشتراکات لنت‌ها`\n\n"
         "📌 **مراحل نهایی‌سازی سفارش و دریافت فاکتور رسمی:**\n"
@@ -3135,7 +3578,28 @@ async def handle_photo_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id if update.effective_user else chat_id
     photo = update.message.photo[-1]
-    caption = update.message.caption or ""
+    caption = (update.message.caption or "").strip()
+
+    # ۰. اگر مدیر عکس لنت را با کپشن /addwelcome (یا «عکس خوش آمد») بفرستد، به آلبوم خوش‌آمدگویی اضافه می‌شود
+    if (user_id == ADMIN_TELEGRAM_ID or is_user_vip(user_id)) and (
+        caption.lower().startswith(("/addwelcome", "/setwelcome", "addwelcome", "عکس خوش آمد", "خوش آمد", "خوش امد"))
+    ):
+        if caption.lower().startswith("/setwelcome"):
+            RUNTIME_WELCOME_PHOTOS.clear()
+        if photo.file_id not in RUNTIME_WELCOME_PHOTOS:
+            RUNTIME_WELCOME_PHOTOS.append(photo.file_id)
+        joined_ids = ",".join(RUNTIME_WELCOME_PHOTOS)
+        await update.message.reply_text(
+            f"✅ **این تصویر به عکس‌های خوش‌آمدگویی ربات اضافه شد!** (تعداد عکس‌های فعلی: `{to_fa_num(len(RUNTIME_WELCOME_PHOTOS))}` عکس)\n\n"
+            "📌 از این لحظه هر کاربری `/start` بزند، این عکس‌ها به صورت آلبوم در ابتدای پیام خوش‌آمدگویی برایش ارسال می‌شود.\n"
+            "🔹 برای افزودن عکس‌های بعدی، کافی است عکس بعدی را هم با کپشن `/addwelcome` بفرستید.\n"
+            "🔹 برای پاک کردن همه عکس‌ها دستور `/clearwelcome` را بزنید.\n\n"
+            "💡 **برای ثبت دائمی در Koyeb (که با ری‌استارت سرور هم پاک نشود):**\n"
+            "متغیر محیطی `WELCOME_PHOTOS` را در Koyeb برابر مقدار زیر قرار دهید:\n"
+            f"`{joined_ids}`",
+            parse_mode="Markdown",
+        )
+        return
 
     # ۱. بررسی اینکه آیا مشتری در مرحله ارسال «تصویر رسید پرداخت» است
     active_oid = USER_ACTIVE_ORDER_ID.get(chat_id)
@@ -4010,6 +4474,7 @@ def main():
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("setbank", set_bank_cmd))
     app.add_handler(CommandHandler("setgemini", set_gemini_cmd))
+    app.add_handler(CommandHandler("clearwelcome", clear_welcome_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_excel_upload))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice_order))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_order))
