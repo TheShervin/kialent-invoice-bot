@@ -3031,25 +3031,30 @@ async def send_vip_direct_invoice_pdf(
                 opposite_mode_label, callback_data="toggle_ordermode"
             )
         ],
-        [
-            InlineKeyboardButton(
-                "🎁 تخفیف درصدی", callback_data="vip_disc_pct"
-            ),
-            InlineKeyboardButton(
-                "💵 تخفیف مبلغی", callback_data="vip_disc_amt"
-            ),
-        ],
+    ]
+    # دکمه‌های تخفیف درصدی و مبلغی فقط و فقط برای مدیر اصلی (ADMIN_TELEGRAM_ID) نمایش داده می‌شوند
+    if int(chat_id) == int(ADMIN_TELEGRAM_ID):
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    "🎁 تخفیف درصدی", callback_data="vip_disc_pct"
+                ),
+                InlineKeyboardButton(
+                    "💵 تخفیف مبلغی", callback_data="vip_disc_amt"
+                ),
+            ]
+        )
+        if discount_amount > 0:
+            kb_rows.append(
+                [InlineKeyboardButton("🗑 حذف تخفیف", callback_data="vip_disc_clear")]
+            )
+    kb_rows.append(
         [
             InlineKeyboardButton(
                 "✏️ اصلاح اقلام همین فاکتور", callback_data="reopen_last_order_edit"
             )
-        ],
-    ]
-    if discount_amount > 0:
-        kb_rows.insert(
-            3,
-            [InlineKeyboardButton("🗑 حذف تخفیف", callback_data="vip_disc_clear")],
-        )
+        ]
+    )
     keyboard = InlineKeyboardMarkup(kb_rows)
 
     await context.bot.send_document(
@@ -3405,8 +3410,8 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id if update.effective_user else chat_id
 
-    # ۰. بررسی اینکه آیا مدیر یا کاربر ویژه در حال وارد کردن «تخفیف درصدی/مبلغی»، «توضیحات زمان تحویل» یا «شماره کارت سفارشی» است
-    if (user_id == ADMIN_TELEGRAM_ID or is_user_vip(user_id)) and chat_id in ADMIN_STATE:
+    # ۰. بررسی اینکه آیا مدیر اصلی (ADMIN_TELEGRAM_ID) در حال وارد کردن «تخفیف درصدی/مبلغی»، «توضیحات زمان تحویل» یا «شماره کارت سفارشی» است
+    if user_id == ADMIN_TELEGRAM_ID and chat_id in ADMIN_STATE:
         adm_st = ADMIN_STATE.get(chat_id)
         st_mode = adm_st.get("mode")
         oid = adm_st.get("order_id")
@@ -4306,7 +4311,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ۷. دکمه‌های پنل مدیریت (مهندس شروین اکبری - ID: 84838606) شامل اعمال تخفیف درصدی و مبلغی دلخواه
     if data.startswith("adm_switch_mode:"):
-        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+        if user_id != ADMIN_TELEGRAM_ID:
             await query.answer("⛔ فقط مدیر سیستم مجاز است.", show_alert=True)
             return
         _, oid, target_mode = data.split(":")
@@ -4341,7 +4346,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("adm_disc_pct:"):
-        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+        if user_id != ADMIN_TELEGRAM_ID:
             await query.answer("⛔ فقط مدیر سیستم مجاز است.", show_alert=True)
             return
         oid = data.split(":")[1]
@@ -4378,7 +4383,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("adm_quick_pct:"):
-        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+        if user_id != ADMIN_TELEGRAM_ID:
             await query.answer("⛔ فقط مدیر سیستم مجاز است.", show_alert=True)
             return
         _, oid, pct_str = data.split(":")
@@ -4405,7 +4410,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("adm_disc_amt:"):
-        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+        if user_id != ADMIN_TELEGRAM_ID:
             await query.answer("⛔ فقط مدیر سیستم مجاز است.", show_alert=True)
             return
         oid = data.split(":")[1]
@@ -4427,7 +4432,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("adm_disc_clear:"):
-        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+        if user_id != ADMIN_TELEGRAM_ID:
             await query.answer("⛔ فقط مدیر سیستم مجاز است.", show_alert=True)
             return
         oid = data.split(":")[1]
@@ -4458,7 +4463,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("adm_approve_proforma:"):
-        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+        if user_id != ADMIN_TELEGRAM_ID:
             await query.answer("⛔ فقط مدیر سیستم مجاز به تایید است.", show_alert=True)
             return
         oid = data.split(":")[1]
@@ -4520,7 +4525,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("adm_custom_bank:"):
-        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+        if user_id != ADMIN_TELEGRAM_ID:
             await query.answer("⛔ فقط مدیر سیستم مجاز به این عملیات است.", show_alert=True)
             return
         oid = data.split(":")[1]
@@ -4537,7 +4542,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("adm_reject_proforma:"):
-        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+        if user_id != ADMIN_TELEGRAM_ID:
             await query.answer("⛔ فقط مدیر سیستم مجاز است.", show_alert=True)
             return
         oid = data.split(":")[1]
@@ -4557,7 +4562,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("adm_approve_pay:"):
-        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+        if user_id != ADMIN_TELEGRAM_ID:
             await query.answer("⛔ فقط مدیر سیستم مجاز به تایید پرداخت است.", show_alert=True)
             return
         oid = data.split(":")[1]
@@ -4576,7 +4581,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("adm_reject_pay:"):
-        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+        if user_id != ADMIN_TELEGRAM_ID:
             await query.answer("⛔ فقط مدیر سیستم مجاز است.", show_alert=True)
             return
         oid = data.split(":")[1]
@@ -4784,8 +4789,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ۹. تبدیل فوری فاکتور <-> پیش‌فاکتور (فقط برای کاربران دارای رمز VIP)
     if data == "vip_disc_pct":
-        if not vip_flag:
-            await query.answer("🔒 این قابلیت مخصوص حالت ویژه است.", show_alert=True)
+        if user_id != ADMIN_TELEGRAM_ID:
+            await query.answer("⛔ اعمال تخفیف فقط مخصوص مدیر سیستم است.", show_alert=True)
             return
         order_data = LAST_ORDERS.get(chat_id)
         if not order_data:
@@ -4794,7 +4799,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ADMIN_STATE[chat_id] = {"mode": "awaiting_vip_discount_percent"}
         fin = calculate_order_financials(order_data["items"], order_data=order_data)
         await query.message.reply_text(
-            f"🎁 **اعمال تخفیف درصدی:**\n"
+            f"🎁 **اعمال تخفیف درصدی (مخصوص مدیریت):**\n"
             f"💵 جمع قبل از تخفیف: `{to_fa_num(fin['subtotal'], comma=True)} ریال`\n\n"
             "✍️ لطفاً **درصد تخفیف دلخواه** (مثلاً `5` یا `3.5`) را در چت تایپ و ارسال کنید:",
             parse_mode="Markdown",
@@ -4802,8 +4807,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "vip_disc_amt":
-        if not vip_flag:
-            await query.answer("🔒 این قابلیت مخصوص حالت ویژه است.", show_alert=True)
+        if user_id != ADMIN_TELEGRAM_ID:
+            await query.answer("⛔ اعمال تخفیف فقط مخصوص مدیر سیستم است.", show_alert=True)
             return
         order_data = LAST_ORDERS.get(chat_id)
         if not order_data:
@@ -4812,7 +4817,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ADMIN_STATE[chat_id] = {"mode": "awaiting_vip_discount_amount"}
         fin = calculate_order_financials(order_data["items"], order_data=order_data)
         await query.message.reply_text(
-            f"💵 **اعمال تخفیف به مبلغ دلخواه:**\n"
+            f"💵 **اعمال تخفیف به مبلغ دلخواه (مخصوص مدیریت):**\n"
             f"💵 جمع قبل از تخفیف: `{to_fa_num(fin['subtotal'], comma=True)} ریال`\n\n"
             "✍️ لطفاً **مبلغ تخفیف دلخواه (به ریال)** را در چت تایپ و ارسال کنید:",
             parse_mode="Markdown",
@@ -4820,8 +4825,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "vip_disc_clear":
-        if not vip_flag:
-            await query.answer("🔒 این قابلیت مخصوص حالت ویژه است.", show_alert=True)
+        if user_id != ADMIN_TELEGRAM_ID:
+            await query.answer("⛔ اعمال تخفیف فقط مخصوص مدیر سیستم است.", show_alert=True)
             return
         order_data = LAST_ORDERS.get(chat_id)
         if not order_data:
