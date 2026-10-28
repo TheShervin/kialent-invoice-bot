@@ -183,13 +183,13 @@ def get_compatible_vehicles_for_item(row_id: str, part_name: str = "") -> str:
     return "مطابق کاتالوگ رسمی شرکت کیالنت البرز نور"
 
 
-# ردیف‌های پایه خودروهای ایرانی (افزایش ۲۰٪ در سفارش خرد):
+# ردیف‌های پایه خودروهای ایرانی (افزایش ۱۰٪ در سفارش خرد):
 # پراید (۱)، پیکان (۲)، پژو ۴۰۵ (۳)، ال ۹۰ (۴)، سمند ملی (۵)، دنا (۶)، تیبا/ریو (۷)،
 # پژو ۲۰۶ تیپ ۲ و ۵ (۸، ۹، ۱۰)، رانا (۱۱، ۱۲)، مزدا وانت (۱۳)، نیسان دیزل (۱۴)
-IRANIAN_20_PERCENT_BASE_ROWS = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
+IRANIAN_10_PERCENT_BASE_ROWS = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}
 
-# کلمات کلیدی خودروهای چینی، شاسی‌بلند و خارجی + شاهین، ماکسیما، پاترول و... (افزایش ۴۰٪ در سفارش خرد)
-FOREIGN_CHINESE_SUV_40_KEYWORDS = [
+# کلمات کلیدی خودروهای چینی، شاسی‌بلند و خارجی + شاهین، ماکسیما، پاترول و... (افزایش ۲۵٪ در سفارش خرد)
+FOREIGN_CHINESE_SUV_25_KEYWORDS = [
     "شاهین", "آریو", "ماکسیما", "پاترول", "پیکاپ", "رونیز", "سرانزا", "دلیکا", "کاپرا",
     "زانتیا", "مگان", "برلیانس", "جک", "هایما", "MVM", "ام وی ام", "ام‌وی‌ام", "X22", "X33", "X55",
     "تیگو", "آریزو", "فونیکس", "فیدلیتی", "دیگنیتی", "لاماری", "کوپا", "ریگان", "KMC", "کی ام سی",
@@ -198,14 +198,14 @@ FOREIGN_CHINESE_SUV_40_KEYWORDS = [
 ]
 
 
-def is_40_percent_retail_item(row_id: str, part_name: str = "") -> bool:
+def is_25_percent_retail_item(row_id: str, part_name: str = "") -> bool:
     """
-    تشخیص اینکه آیا کالا در حالت «سفارش خرد» مشمول ۴۰٪ افزایش قیمت است یا ۲۰٪:
-    - ایرانی‌ها (ردیف‌های ۱ تا ۱۴): ۲۰٪ افزایش
-    - چینی‌ها، شاسی‌بلندها و خارجی‌ها (ردیف‌های ۱۵ تا ۶۱ شامل شاهین، ماکسیما، پاترول، زانتیا، مگان و...): ۴۰٪ افزایش
+    تشخیص اینکه آیا کالا در حالت «سفارش خرد» مشمول ۲۵٪ افزایش قیمت است یا ۱۰٪:
+    - ایرانی‌ها (ردیف‌های ۱ تا ۱۴): ۱۰٪ افزایش
+    - چینی‌ها، شاسی‌بلندها و خارجی‌ها (ردیف‌های ۱۵ تا ۶۱ شامل شاهین، ماکسیما، پاترول، زانتیا، مگان و...): ۲۵٪ افزایش
     """
     name_norm = (part_name or "").strip()
-    for kw in FOREIGN_CHINESE_SUV_40_KEYWORDS:
+    for kw in FOREIGN_CHINESE_SUV_25_KEYWORDS:
         if kw.lower() in name_norm.lower():
             return True
     try:
@@ -214,7 +214,7 @@ def is_40_percent_retail_item(row_id: str, part_name: str = "") -> bool:
         base_row = int(m.group(1)) if m else int(float(s_clean))
         if base_row >= 15:
             return True
-        if base_row in IRANIAN_20_PERCENT_BASE_ROWS:
+        if base_row in IRANIAN_10_PERCENT_BASE_ROWS:
             return False
     except Exception:
         pass
@@ -225,7 +225,7 @@ def calculate_final_unit_price(base_price: int, row_id: str, part_name: str, ord
     """
     محاسبه قیمت نهایی هر دست لنت بر اساس نوع سفارش:
     - wholesale (سفارش عمده): همان قیمت پایه اکسل (۰٪ افزایش)
-    - retail (سفارش خرد): ایرانی‌ها +۲۰٪ و چینی/شاسی‌بلند/خارجی (شامل شاهین، ماکسیما، پاترول و...) +۴۰٪
+    - retail (سفارش خرد): ایرانی‌ها +۱۰٪ و چینی/شاسی‌بلند/خارجی (شامل شاهین، ماکسیما، پاترول و...) +۲۵٪
     خروجی: (قیمت نهایی به ریال، درصد افزایش اعمال‌شده)
     """
     if base_price is None:
@@ -233,10 +233,10 @@ def calculate_final_unit_price(base_price: int, row_id: str, part_name: str, ord
     if order_mode != "retail":
         return int(base_price), 0
 
-    if is_40_percent_retail_item(row_id, part_name):
-        return int(round(base_price * 1.40)), 40
+    if is_25_percent_retail_item(row_id, part_name):
+        return int(round(base_price * 1.25)), 25
     else:
-        return int(round(base_price * 1.20)), 20
+        return int(round(base_price * 1.10)), 10
 
 
 # ==============================================================================
@@ -2200,7 +2200,8 @@ async def forward_receipt_to_admin(
             )
 
         await update.message.reply_text(
-            f"✅ **رسید پرداخت سفارش `#{to_fa_num(oid)}` با موفقیت دریافت شد و برای مدیریت ({ADMIN_USERNAME}) ارسال گردید.**\n\n"
+            f"✅ **ارسال انجام شد!**\n\n"
+            f"رسید پرداخت سفارش `#{to_fa_num(oid)}` شما با موفقیت برای مدیریت ({ADMIN_USERNAME}) ارسال گردید.\n"
             "⏳ پس از بررسی و تایید تراکنش توسط مدیریت، **فاکتور نهایی** به همراه **زمان تحویل بار** در همین چت برای شما ارسال خواهد شد.",
             parse_mode="Markdown",
         )
@@ -2386,6 +2387,14 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_reply_keyboard(user_id=user_id),
         )
         return
+
+    # ۴.۵ بررسی اینکه آیا مشتری در مرحله ارسال رسید پرداخت (awaiting_receipt) پیام متنی فرستاده است
+    active_oid = USER_ACTIVE_ORDER_ID.get(chat_id)
+    if active_oid and active_oid in ACTIVE_PAYMENT_ORDERS:
+        ord_rec = ACTIVE_PAYMENT_ORDERS[active_oid]
+        if ord_rec.get("status") == "awaiting_receipt" and chat_id not in USER_EDIT_STATE and chat_id not in AWAITING_QUESTION_MODE:
+            await forward_receipt_to_admin(update, context, ord_rec)
+            return
 
     # ۵. بررسی اینکه آیا کاربر در حال وارد کردن «عدد دلخواه تعداد» یا «افزودن لنت جدید» در منوی اصلاح است
     edit_state = USER_EDIT_STATE.get(chat_id)
@@ -2628,11 +2637,19 @@ async def handle_photo_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     chat_id = query.message.chat_id
     user_id = update.effective_user.id if update.effective_user else chat_id
     vip_flag = is_user_vip(user_id)
     data = query.data or ""
+    if not data.startswith(("cust_submit_proforma:", "adm_", "item_del:", "item_shim:", "toggle_")):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+    if data == "already_sent_noop":
+        await query.answer("✅ این پیش‌فاکتور قبلاً برای مدیریت ارسال شده است.", show_alert=True)
+        return
 
     # ۱. بازگشت به منوی اصلی
     if data == "back_to_main_menu":
@@ -2901,8 +2918,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=admin_kb,
             )
+            try:
+                await query.answer("✅ ارسال انجام شد!", show_alert=True)
+            except Exception:
+                pass
+            try:
+                sent_kb = InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                "✅ ارسال انجام شد (در انتظار تایید مدیریت)",
+                                callback_data="already_sent_noop",
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                "🏠 بازگشت به منوی اصلی", callback_data="back_to_main_menu"
+                            )
+                        ],
+                    ]
+                )
+                await query.edit_message_reply_markup(reply_markup=sent_kb)
+            except Exception:
+                pass
             await query.message.reply_text(
-                f"✅ **پیش‌فاکتور شما (کد `#{to_fa_num(oid)}`) با موفقیت برای مدیریت ({ADMIN_USERNAME}) ارسال شد.**\n\n"
+                f"✅ **ارسال انجام شد!**\n\n"
+                f"پیش‌فاکتور شما (کد `#{to_fa_num(oid)}`) با موفقیت برای مدیریت ({ADMIN_USERNAME}) ارسال گردید.\n"
                 "⏳ لطفاً منتظر بمانید؛ به محض تایید مدیریت، **شماره کارت و اطلاعات پرداخت** در همین چت برای شما ارسال خواهد شد.",
                 parse_mode="Markdown",
             )
