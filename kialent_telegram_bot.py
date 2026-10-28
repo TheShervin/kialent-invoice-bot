@@ -38,6 +38,19 @@ from telegram.ext import (
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "YOUR_OPENROUTER_API_KEY_HERE")
 
+# مشخصات مدیر (مهندس شروین اکبری) جهت دریافت پیش‌فاکتورها، رسیدهای پرداخت و تایید نهایی فاکتور
+ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "84838606"))
+ADMIN_USERNAME = os.getenv("ADMIN_TELEGRAM_USERNAME", "@THE_SHERVIN")
+
+# اطلاعات حساب و شماره کارت پیش‌فرض (از طریق دستور /setbank توسط ادمین یا متغیر محیطی PAYMENT_BANK_INFO هم قابل تغییر است)
+PAYMENT_BANK_INFO = os.getenv(
+    "PAYMENT_BANK_INFO",
+    "💳 **شماره کارت و حساب جهت واریز وجه:**\n"
+    "• صاحب حساب: **شروین اکبری (شرکت کیالنت البرز نور)**\n"
+    "• شماره کارت / شبای اعلامی:\n"
+    "_(در صورت نیاز به استعلام شماره کارت یا حساب روز، با آیدی @THE_SHERVIN یا شماره ۰۹۱۲۰۷۵۳۹۵۸ هماهنگ فرمایید)_",
+)
+
 # مسیر فایل اکسل لیست قیمت (می‌توانید فایل اکسل جدید را مستقیم در تلگرام هم برای ربات بفرستید)
 EXCEL_FILE_PATH = os.getenv("EXCEL_FILE_PATH", "New Microsoft Excel Worksheet.xlsx")
 
@@ -646,15 +659,27 @@ def call_openrouter_models(
 
 
 
-def format_full_catalog_with_compatibility(catalog: list, order_mode: str = "wholesale") -> str:
+def format_full_catalog_with_compatibility(catalog: list, order_mode: str = "wholesale", show_prices: bool = False) -> str:
     """
     آماده‌سازی بانک اطلاعات کامل محصولات کیالنت البرز نور شامل:
-    ردیف، کد فنی، نام قطعه، قیمت با شیم و بدون شیم (متناسب با حالت عمده/خرد کاربر) و لیست کامل خودروهای سازگار (اشتراکات)
+    ردیف، کد فنی، نام قطعه و لیست کامل خودروهای سازگار (اشتراکات).
+    در حالت سفارش عمده تا قبل از صدور پیش‌فاکتور، قیمت‌ها نمایش داده نمی‌شوند.
     """
+    if order_mode == "wholesale" and not show_prices:
+        lines = [
+            "ردیف | کد فنی | نام لنت تولیدی کیالنت البرز نور | وضعیت موجودی | خودروهای سازگار و مشترک (اشتراکات)"
+        ]
+        for item in catalog:
+            avail = "موجود" if (item["price_no_shim"] or item["price_with_shim"]) else "ناموجود"
+            compat = get_compatible_vehicles_for_item(item["row_id"], item["name"])
+            lines.append(
+                f"{item['row_id']} | {item['wva']} | {item['name']} | {avail} | {compat}"
+            )
+        return "\n".join(lines)
+
     lines = [
         "ردیف | کد فنی | نام لنت تولیدی کیالنت البرز نور | قیمت بدون شیم (ریال) | قیمت با شیم (ریال) | خودروهای سازگار و مشترک (اشتراکات)"
     ]
-    seen_base_rows = set()
     for item in catalog:
         p_no_base = item["price_no_shim"]
         p_yes_base = item["price_with_shim"]
@@ -670,24 +695,25 @@ def format_full_catalog_with_compatibility(catalog: list, order_mode: str = "who
     return "\n".join(lines)
 
 
-def answer_catalog_question(user_question: str, catalog: list, order_mode: str = "wholesale") -> str:
+def answer_catalog_question(user_question: str, catalog: list, order_mode: str = "wholesale", is_vip: bool = False) -> str:
     """
     پاسخگویی هوشمند و دقیق به سوالات فنی مشتریان درباره:
     - اشتراکات لنت‌ها (اینکه هر لنت به چه ماشین‌هایی می‌خورد یا برای یک ماشین خاص چه لنتی در سبد محصولات داریم)
     - لیست لنت‌های تولیدی شرکت کیالنت البرز نور
-    - شرایط فروش (حداقل خرید عمده ۱ کارتن معادل ۱۰ دست لنت و تسویه نقدی)
+    - شرایط فروش (حداقل خرید عمده ۲ کارتن معادل ۲۰ دست لنت و تسویه نقدی)
     """
-    full_kb = format_full_catalog_with_compatibility(catalog, order_mode=order_mode)
+    full_kb = format_full_catalog_with_compatibility(catalog, order_mode=order_mode, show_prices=is_vip)
     system_prompt = f"""شما کارشناس فنی و مشاور فروش رسمی «شرکت کیالنت البرز نور» (تولیدکننده لنت ترمز خودرو) هستید.
 وظیفه شما پاسخگویی دقیق، محترمانه، روان و کامل به سوالات مشتریان بر اساس بانک اطلاعات رسمی کاتالوگ زیر است:
 
-=== کاتالوگ جامع محصولات، قیمت‌ها و اشتراکات لنت‌های شرکت کیالنت البرز نور ===
+=== کاتالوگ جامع محصولات و اشتراکات لنت‌های شرکت کیالنت البرز نور ===
 {full_kb}
 
 === قوانین و شرایط فروش شرکت ===
-- حداقل خرید عمده: یک کارتن یا معادل ۱۰ دست لنت می‌باشد.
+- حداقل خرید عمده: ۲ کارتن یا معادل ۲۰ دست لنت می‌باشد (سفارش‌های کمتر از ۱۵ دست، سفارش عمده محسوب نمی‌شوند و به سفارش خرد منتقل می‌شوند).
 - نحوه تسویه: تمامی سفارشات به صورت نقدی تسویه می‌شوند.
-- هرگز درباره درصد تفاوت قیمت خرد و عمده (۲۰٪ یا ۴۰٪) صحبت نکنید؛ اگر مشتری قیمت پرسید، فقط قیمت نهایی درج‌شده در جدول بالا را به ریال (یا تومان) اعلام کنید.
+- قیمت‌های سفارش عمده تا قبل از ثبت سفارش و صدور پیش‌فاکتور رسمی نمایش داده نمی‌شود؛ اگر مشتری در حالت عمده قیمت تک‌تک لنت‌ها را پرسید، محترمانه بگویید که کافی است لیست سفارش خود را بفرستد تا پیش‌فاکتور رسمی با قیمت روز برایش صادر شود.
+- هرگز درباره درصد تفاوت قیمت خرد و عمده صحبت نکنید.
 - اگر مشتری پرسید «چه لنت‌هایی دارید؟»، دسته‌بندی کامل لنت‌های تولیدی ما (ایرانی، چینی، شاسی‌بلند و وارداتی) را به صورت مرتب و خوانا معرفی کنید.
 - اگر مشتری پرسید «لنت فلان ماشین به چه ماشین‌هایی می‌خورد؟» یا «برای فلان ماشین چه لنتی دارید و با چی مشترکه؟»، دقیقاً از ستون «خودروهای سازگار و مشترک (اشتراکات)» در جدول بالا استفاده کنید و کد فنی و تمام خودروهای مشترک آن را کامل بنویسید.
 - پاسخ را با فرمت زیبا، بولت‌بندی شده و اعداد فارسی بنویسید."""
@@ -1535,19 +1561,40 @@ def generate_pdf_bytes(order_data: dict) -> bytes:
 
 
 # ==============================================================================
-# ۸. هندلرهای ربات تلگرام (پیش‌نمایش سفارش، اصلاح تعاملی اقلام، افزودن لنت، ویس، عکس و مشاور فنی)
+# ۸. هندلرهای ربات تلگرام (سفارش عمده ۲۰ دست / حداقل ۱۵ دست، مخفی بودن قیمت عمده قبل از پیش‌فاکتور،
+#    چرخه تایید پیش‌فاکتور و رسید پرداخت توسط مهندس شروین اکبری، و رمز ۵ رقمی صدور مستقیم فاکتور)
 # ==============================================================================
 LAST_ORDERS = {}
 PENDING_VOICE_TEXTS = {}
 AWAITING_VOICE_EDIT = set()
 AWAITING_QUESTION_MODE = set()
-PENDING_DRAFT_ORDERS = {}  # chat_id -> order_data در حال بررسی و اصلاح قبل از صدور PDF
-USER_EDIT_STATE = {}  # chat_id -> {"mode": "awaiting_qty", "item_idx": idx} یا {"mode": "awaiting_add_item"}
-USER_ORDER_MODES = {}  # chat_id -> "wholesale" (سفارش عمده) یا "retail" (سفارش خرد)
+AWAITING_VIP_CODE_USERS = set()  # کاربرانی که روی دکمه «🔐 وارد کردن رمز» کلیک کرده‌اند
+VIP_UNLOCKED_USERS = set()       # کاربرانی که رمز ۵ رقم آخر User ID خود را درست وارد کرده‌اند
+PENDING_DRAFT_ORDERS = {}        # chat_id -> order_data در مرحله پیش‌نمایش و اصلاح اقلام
+USER_EDIT_STATE = {}             # chat_id -> {"mode": "awaiting_qty", "item_idx": idx} یا {"mode": "awaiting_add_item"}
+USER_ORDER_MODES = {}            # chat_id -> "wholesale" (سفارش عمده) یا "retail" (سفارش خرد)
+
+# مدیریت چرخه پرداخت و تایید مدیر (مهندس شروین اکبری)
+ORDER_COUNTER = 1000
+ACTIVE_PAYMENT_ORDERS = {}       # order_id -> dict(order_data, customer_chat_id, customer_user_info, status, ...)
+USER_ACTIVE_ORDER_ID = {}        # customer_chat_id -> order_id
+ADMIN_STATE = {}                 # admin_chat_id -> {"mode": "awaiting_delivery_note", "order_id": oid} یا {"mode": "awaiting_custom_bank", "order_id": oid}
+RUNTIME_PAYMENT_BANK_INFO = PAYMENT_BANK_INFO
 
 BTN_WHOLESALE_TEXT = "📦 سفارش عمده"
 BTN_RETAIl_TEXT = "🛍 سفارش خرد"
 BTN_ASK_QUESTION_TEXT = "❓ اگر سوالی داری ازم بپرس (اشتراکات و لیست لنت‌ها)"
+BTN_VIP_CODE_TEXT = "🔐 وارد کردن رمز"
+
+
+def get_expected_vip_code(user_id: int) -> str:
+    """رمز اختصاصی هر فرد: ۵ رقم آخر User ID تلگرام همان فرد"""
+    s = str(user_id).strip()
+    return s[-5:] if len(s) >= 5 else s
+
+
+def is_user_vip(user_id: int) -> bool:
+    return user_id in VIP_UNLOCKED_USERS
 
 
 def get_user_order_mode(chat_id: int) -> str:
@@ -1560,20 +1607,23 @@ def get_order_mode_label(order_mode: str) -> str:
     return "📦 سفارش عمده"
 
 
-def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
+def get_main_reply_keyboard(user_id: int = None) -> ReplyKeyboardMarkup:
+    vip_label = "🔓 حالت ویژه فعال است" if (user_id and is_user_vip(user_id)) else BTN_VIP_CODE_TEXT
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton(BTN_WHOLESALE_TEXT), KeyboardButton(BTN_RETAIl_TEXT)],
             [KeyboardButton(BTN_ASK_QUESTION_TEXT)],
+            [KeyboardButton(vip_label)],
         ],
         resize_keyboard=True,
         is_persistent=True,
     )
 
 
-def get_start_mode_inline_keyboard(current_mode: str) -> InlineKeyboardMarkup:
+def get_start_mode_inline_keyboard(current_mode: str, user_id: int = None) -> InlineKeyboardMarkup:
     w_check = "✅ " if current_mode == "wholesale" else ""
     r_check = "✅ " if current_mode == "retail" else ""
+    vip_btn_txt = "🔓 حالت صدور مستقیم فاکتور فعال است" if (user_id and is_user_vip(user_id)) else "🔐 وارد کردن رمز"
     return InlineKeyboardMarkup(
         [
             [
@@ -1590,33 +1640,81 @@ def get_start_mode_inline_keyboard(current_mode: str) -> InlineKeyboardMarkup:
                     callback_data="ask_technical_question",
                 )
             ],
+            [
+                InlineKeyboardButton(
+                    vip_btn_txt,
+                    callback_data="enter_vip_password",
+                )
+            ],
         ]
     )
 
 
-def build_welcome_text() -> str:
+def build_welcome_text(user_id: int = None) -> str:
+    vip_badge = "\n🌟 **حالت ویژه (صدور مستقیم فاکتور بدون نیاز به مراحل پرداخت) برای شما فعال است.**\n" if (user_id and is_user_vip(user_id)) else ""
     return (
         "سلام! به سامانه هوشمند فروش و مشاوره فنی **شرکت کیالنت البرز نور** خوش آمدید.\n\n"
         "📌 **شرایط فروش و ثبت سفارش:**\n"
-        "• **حداقل خرید عمده، یک کارتن یا معادل ۱۰ دست لنت می‌باشد.**\n"
-        "• **تمامی سفارشات به صورت نقدی تسویه می‌شوند.**\n\n"
-        "👇 **لطفاً از دکمه‌های زیر نوع سفارش خود را انتخاب کنید یا سوال فنی خود را بپرسید:**\n"
+        "• **حداقل خرید عمده، ۲ کارتن یا معادل ۲۰ دست لنت می‌باشد.**\n"
+        "• **تمامی سفارشات به صورت نقدی تسویه می‌شوند.**"
+        f"{vip_badge}\n\n"
+        "👇 **لطفاً از دکمه‌های زیر بخش مورد نظر خود را انتخاب کنید:**\n"
         "1️⃣ **📦 سفارش عمده** یا **🛍 سفارش خرد** (امکان ارسال سفارش به صورت **متن، ویس یا عکس**)\n"
-        "2️⃣ **❓ پرسش و مشاوره فنی:** اگر درباره **اشتراکات لنت‌ها**، اینکه **چه لنت‌هایی تولید می‌کنیم** یا **کدام لنت به کدام خودرو می‌خورد** سوالی دارید، دکمه زیر را بزنید و بپرسید."
+        "2️⃣ **❓ پرسش و مشاوره فنی:** پاسخگویی به سوالات شما درباره **اشتراکات لنت‌ها**، **لیست لنت‌های تولیدی** و اینکه **کدام لنت به کدام خودرو می‌خورد**\n"
+        "3️⃣ **🔐 وارد کردن رمز:** ویژه همکاران و صدور مستقیم فاکتور"
     )
 
 
-def format_draft_order_summary(order_data: dict) -> str:
-    """نمایش شفاف لنت‌های تشخیص داده شده قبل از صدور فاکتور"""
+def enforce_wholesale_minimum_rule(order_data: dict, chat_id: int) -> str:
+    """
+    قانون حداقل تعداد سفارش عمده:
+    - اگر کاربر در حالت «سفارش عمده» باشد و جمع کل لنت‌های سفارش کمتر از ۱۵ دست باشد:
+      پیام می‌دهد که «این سفارش، سفارش عمده محسوب نمی‌شود» و سفارش را خودکار به «سفارش خرد» برمی‌گرداند.
+    """
+    order_mode = order_data.get("order_mode", get_user_order_mode(chat_id))
+    total_qty = sum(i["qty"] for i in order_data.get("items", []))
+    notice = ""
+
+    # حذف هشدارهای قدیمی مربوط به حداقل خرید
+    order_data["warnings"] = [
+        w for w in order_data.get("warnings", [])
+        if "حداقل خرید عمده" not in w and "سفارش عمده محسوب" not in w
+    ]
+
+    if order_mode == "wholesale" and 0 < total_qty < 15:
+        order_data["order_mode"] = "retail"
+        USER_ORDER_MODES[chat_id] = "retail"
+        apply_order_mode_pricing_to_items(order_data["items"], order_mode="retail")
+        notice = (
+            f"⚠️ **توجه:** از آنجا که مجموع تعداد سفارش شما ({to_fa_num(total_qty)} دست) کمتر از ۱۵ دست است، "
+            "**این سفارش، سفارش عمده محسوب نمی‌شود** و به حالت **«🛍 سفارش خرد»** تغییر یافت."
+        )
+        order_data["warnings"].append(
+            f"به دلیل کمتر بودن تعداد از ۱۵ دست ({to_fa_num(total_qty)} دست)، این سفارش عمده محسوب نشده و به «سفارش خرد» تغییر یافت."
+        )
+    elif order_data.get("order_mode") == "wholesale" and 15 <= total_qty < 20:
+        order_data["warnings"].append(
+            f"حداقل استاندارد خرید عمده ۲ کارتن (۲۰ دست لنت) می‌باشد (جمع فعلی: {to_fa_num(total_qty)} دست)."
+        )
+
+    return notice
+
+
+def format_draft_order_summary(order_data: dict, is_vip: bool = False) -> str:
+    """
+    نمایش شفاف لنت‌های تشخیص داده شده قبل از صدور پیش‌فاکتور:
+    - در حالت «سفارش عمده» (برای کاربران عادی)، قیمت‌ها تا قبل از صدور پیش‌فاکتور نمایش داده نمی‌شود!
+    """
     order_mode = order_data.get("order_mode", "wholesale")
     apply_order_mode_pricing_to_items(order_data["items"], order_mode=order_mode)
 
-    doc_type = order_data.get("doc_type", "پیش‌فاکتور")
+    hide_prices = (order_mode == "wholesale") and (not is_vip)
+    doc_label = order_data.get("doc_type", "پیش‌فاکتور") if is_vip else "پیش‌فاکتور"
     cust = order_data.get("customer_title", "مشتری گرامی")
     mode_label = get_order_mode_label(order_mode)
 
     lines = [
-        f"🧾 **پیش‌نمایش {doc_type} سفارش {cust}**",
+        f"🧾 **پیش‌نمایش اقلام {doc_label} سفارش {cust}**",
         f"🏷 **نوع سفارش:** `{mode_label}` | 📅 **تاریخ:** `{to_fa_num(order_data.get('date', get_today_jalali()))}`",
         "",
         "📦 **لنت‌های تشخیص داده شده:**",
@@ -1629,22 +1727,26 @@ def format_draft_order_summary(order_data: dict) -> str:
         total_payable += line_total
         total_qty += it["qty"]
         shim_str = "با شیم" if it.get("with_shim") else "بدون شیم"
-        lines.append(
-            f"{to_fa_num(idx)}. **{it['base_name']}** ({shim_str})\n"
-            f"   🔹 کد: `{it['wva']}` | تعداد: **{to_fa_num(it['qty'])} دست** | فی: `{to_fa_num(it['unit_price'], comma=True)}` | جمع: `{to_fa_num(line_total, comma=True)} ریال`"
-        )
+        if hide_prices:
+            lines.append(
+                f"{to_fa_num(idx)}. **{it['base_name']}** ({shim_str})\n"
+                f"   🔹 کد فنی: `{it['wva']}` | تعداد: **{to_fa_num(it['qty'])} دست**"
+            )
+        else:
+            lines.append(
+                f"{to_fa_num(idx)}. **{it['base_name']}** ({shim_str})\n"
+                f"   🔹 کد: `{it['wva']}` | تعداد: **{to_fa_num(it['qty'])} دست** | فی: `{to_fa_num(it['unit_price'], comma=True)}` | جمع: `{to_fa_num(line_total, comma=True)} ریال`"
+            )
 
     if not order_data.get("items"):
         lines.append("⚠️ _در حال حاضر هیچ لنتی در لیست نیست. از دکمه اصلاح/اضافه کردن استفاده کنید._")
 
     lines.append("")
     lines.append(f"📊 **جمع کل تعداد:** `{to_fa_num(total_qty)} دست`")
-    lines.append(f"💰 **مبلغ کل قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`")
-
-    if order_mode == "wholesale" and 0 < total_qty < 10:
-        lines.append(
-            f"\n⚠️ **توجه:** حداقل خرید عمده ۱ کارتن (۱۰ دست لنت) می‌باشد (جمع فعلی: {to_fa_num(total_qty)} دست)."
-        )
+    if hide_prices:
+        lines.append("💡 _قیمت‌های سفارش عمده پس از تایید اقلام، در فایل «پیش‌فاکتور» درج و نمایش داده می‌شود._")
+    else:
+        lines.append(f"💰 **مبلغ کل قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`")
 
     if order_data.get("warnings"):
         lines.append("\n⚠️ **تذکر:**")
@@ -1655,13 +1757,14 @@ def format_draft_order_summary(order_data: dict) -> str:
     return "\n".join(lines)
 
 
-def get_draft_summary_keyboard() -> InlineKeyboardMarkup:
+def get_draft_summary_keyboard(is_vip: bool = False) -> InlineKeyboardMarkup:
     """سه دکمه اصلی زیر پیش‌نمایش لنت‌های تشخیص داده شده: تایید، اصلاح، بازگشت به منوی اصلی"""
+    confirm_label = "✅ تایید و صدور مستقیم فاکتور / پیش‌فاکتور" if is_vip else "✅ تایید و دریافت پیش‌فاکتور"
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "✅ تایید و صدور فاکتور", callback_data="draft_confirm"
+                    confirm_label, callback_data="draft_confirm"
                 )
             ],
             [
@@ -1678,7 +1781,7 @@ def get_draft_summary_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def get_draft_edit_list_keyboard(order_data: dict) -> InlineKeyboardMarkup:
+def get_draft_edit_list_keyboard(order_data: dict, is_vip: bool = False) -> InlineKeyboardMarkup:
     """
     ساخت دکمه به تعداد لنت‌های سفارش + دکمه اضافه کردن لنت جدید + تایید نهایی + بازگشت به منوی اصلی
     """
@@ -1692,8 +1795,9 @@ def get_draft_edit_list_keyboard(order_data: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("➕ اضافه کردن لنت جدید", callback_data="draft_add_item")]
     )
     if order_data.get("items"):
+        confirm_label = "✅ تایید نهایی و صدور فاکتور" if is_vip else "✅ تایید نهایی و دریافت پیش‌فاکتور"
         buttons.append(
-            [InlineKeyboardButton("✅ تایید نهایی و صدور فاکتور", callback_data="draft_confirm")]
+            [InlineKeyboardButton(confirm_label, callback_data="draft_confirm")]
         )
     buttons.append(
         [InlineKeyboardButton("🏠 بازگشت به منوی اصلی", callback_data="back_to_main_menu")]
@@ -1701,39 +1805,38 @@ def get_draft_edit_list_keyboard(order_data: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons)
 
 
-def format_single_item_edit_text(item: dict, idx: int, total_items: int, has_5_6: bool) -> str:
+def format_single_item_edit_text(
+    item: dict, idx: int, total_items: int, has_5_6: bool, hide_prices: bool = False
+) -> str:
     shim_str = "✅ با شیم" if item.get("with_shim") else "❌ بدون شیم"
     thickness_note = ""
     if has_5_6:
         curr_th = "۶ میل" if str(item["row_id"]).endswith(".2") else "۵ میل"
         thickness_note = f"\n📏 **مدل کفشک (ضخامت):** `{curr_th}` (قابل تغییر بین ۵ میل و ۶ میل)"
 
-    line_total = item["qty"] * item["unit_price"]
+    price_block = ""
+    if not hide_prices:
+        line_total = item["qty"] * item["unit_price"]
+        price_block = (
+            f"\n🔹 **قیمت واحد:** `{to_fa_num(item['unit_price'], comma=True)} ریال`"
+            f"\n💰 **جمع این ردیف:** `{to_fa_num(line_total, comma=True)} ریال`"
+        )
+
     return (
         f"🔧 **ویرایش ردیف {to_fa_num(idx + 1)} از {to_fa_num(total_items)}:**\n\n"
         f"🔹 **نام قطعه:** `{item['base_name']}`\n"
         f"🔹 **کد فنی:** `{item['wva']}`\n"
         f"🔹 **وضعیت شیم:** {shim_str}"
         f"{thickness_note}\n"
-        f"🔹 **تعداد فعلی:** `{to_fa_num(item['qty'])} دست`\n"
-        f"🔹 **قیمت واحد:** `{to_fa_num(item['unit_price'], comma=True)} ریال`\n"
-        f"💰 **جمع این ردیف:** `{to_fa_num(line_total, comma=True)} ریال`\n\n"
+        f"🔹 **تعداد فعلی:** `{to_fa_num(item['qty'])} دست`"
+        f"{price_block}\n\n"
         "👇 از دکمه‌های زیر تعداد، وضعیت شیم یا ضخامت کفشک را تغییر دهید:"
     )
 
 
-def get_single_item_edit_keyboard(item: dict, idx: int, catalog: list) -> InlineKeyboardMarkup:
-    """
-    کیبورد ویرایش یک لنت:
-    - تغییر تعداد (-10, -5, -1, +1, +5, +10 و تایپ عدد دلخواه)
-    - تغییر با شیم / بدون شیم
-    - اگر در کاتالوگ ۲ مدل کفشک (۵ میل و ۶ میل) دارد: دکمه تغییر ۵ میل / ۶ میل
-    - حذف این ردیف
-    - بازگشت به لیست اقلام / تایید و صدور فاکتور
-    """
+def get_single_item_edit_keyboard(item: dict, idx: int, catalog: list, is_vip: bool = False) -> InlineKeyboardMarkup:
     rows = []
 
-    # ۱. دکمه‌های کم و زیاد کردن سریع تعداد
     rows.append(
         [
             InlineKeyboardButton("➖ ۱", callback_data=f"item_qty:{idx}:-1"),
@@ -1755,7 +1858,6 @@ def get_single_item_edit_keyboard(item: dict, idx: int, catalog: list) -> Inline
         ]
     )
 
-    # ۲. دکمه تغییر وضعیت شیم‌دار / بدون شیم
     with_shim = item.get("with_shim", False)
     shim_yes_mark = "✅ " if with_shim else ""
     shim_no_mark = "✅ " if not with_shim else ""
@@ -1770,7 +1872,6 @@ def get_single_item_edit_keyboard(item: dict, idx: int, catalog: list) -> Inline
         ]
     )
 
-    # ۳. اگر در کاتالوگ ۲ مدل کفشک (۵ میل و ۶ میل) دارد، دکمه‌های ۵ میل و ۶ میل را نمایش بده
     has_5_6, r5, r6 = has_two_backing_plate_models(item["row_id"], catalog)
     if has_5_6:
         is_6mm = str(item["row_id"]).endswith(".2")
@@ -1787,16 +1888,16 @@ def get_single_item_edit_keyboard(item: dict, idx: int, catalog: list) -> Inline
             ]
         )
 
-    # ۴. حذف ردیف و بازگشت به لیست
     rows.append(
         [
-            InlineKeyboardButton("🗑 حذف این لنت از فاکتور", callback_data=f"item_del:{idx}")
+            InlineKeyboardButton("🗑 حذف این لنت از سفارش", callback_data=f"item_del:{idx}")
         ]
     )
+    confirm_lbl = "✅ تایید و صدور فاکتور" if is_vip else "✅ تایید و دریافت پیش‌فاکتور"
     rows.append(
         [
             InlineKeyboardButton("🔙 بازگشت به لیست لنت‌ها", callback_data="draft_edit_menu"),
-            InlineKeyboardButton("✅ تایید و صدور فاکتور", callback_data="draft_confirm"),
+            InlineKeyboardButton(confirm_lbl, callback_data="draft_confirm"),
         ]
     )
     return InlineKeyboardMarkup(rows)
@@ -1804,28 +1905,66 @@ def get_single_item_edit_keyboard(item: dict, idx: int, catalog: list) -> Inline
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else chat_id
     if chat_id not in USER_ORDER_MODES:
         USER_ORDER_MODES[chat_id] = "wholesale"
     AWAITING_QUESTION_MODE.discard(chat_id)
     AWAITING_VOICE_EDIT.discard(chat_id)
+    AWAITING_VIP_CODE_USERS.discard(chat_id)
     USER_EDIT_STATE.pop(chat_id, None)
     current_mode = get_user_order_mode(chat_id)
 
-    welcome = build_welcome_text()
+    welcome = build_welcome_text(user_id=user_id)
     await update.message.reply_text(
         welcome,
         parse_mode="Markdown",
-        reply_markup=get_main_reply_keyboard(),
+        reply_markup=get_main_reply_keyboard(user_id=user_id),
     )
     await update.message.reply_text(
         f"🔘 **بخش مورد نظر خود را انتخاب کنید** (حالت فعلی: `{get_order_mode_label(current_mode)}`):",
         parse_mode="Markdown",
-        reply_markup=get_start_mode_inline_keyboard(current_mode),
+        reply_markup=get_start_mode_inline_keyboard(current_mode, user_id=user_id),
+    )
+
+
+async def set_bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دستور ویژه مدیر (/setbank) برای تنظیم یا تغییر متن شماره کارت و حساب بانکی"""
+    global RUNTIME_PAYMENT_BANK_INFO
+    user_id = update.effective_user.id if update.effective_user else 0
+    if user_id != ADMIN_TELEGRAM_ID and not is_user_vip(user_id):
+        await update.message.reply_text("⛔ این دستور فقط مخصوص مدیر سیستم است.")
+        return
+
+    new_info = " ".join(context.args).strip() if context.args else ""
+    if not new_info:
+        await update.message.reply_text(
+            "💳 **اطلاعات حساب و کارت فعلی:**\n\n"
+            f"{RUNTIME_PAYMENT_BANK_INFO}\n\n"
+            "✏️ برای تغییر دائمی در ربات، متن جدید را بعد از دستور `/setbank` بنویسید؛ مثال:\n"
+            "`/setbank شماره کارت: ۶۰۳۷۹۹۷۵XXXX به نام شروین اکبری - بانک ملی`",
+            parse_mode="Markdown",
+        )
+        return
+
+    RUNTIME_PAYMENT_BANK_INFO = f"💳 **اطلاعات حساب و شماره کارت جهت واریز وجه:**\n{new_info}"
+    await update.message.reply_text(
+        f"✅ اطلاعات پرداخت و شماره کارت با موفقیت بروزرسانی شد:\n\n{RUNTIME_PAYMENT_BANK_INFO}",
+        parse_mode="Markdown",
     )
 
 
 async def handle_excel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
+    chat_id = update.effective_chat.id
+
+    # اگر مشتری در مرحله ارسال رسید پرداخت است و فایل PDF/تصویر رسید را به صورت Document فرستاده است
+    active_oid = USER_ACTIVE_ORDER_ID.get(chat_id)
+    if active_oid and active_oid in ACTIVE_PAYMENT_ORDERS:
+        ord_rec = ACTIVE_PAYMENT_ORDERS[active_oid]
+        if ord_rec.get("status") == "awaiting_receipt" and not doc.file_name.lower().endswith(".xlsx"):
+            await forward_receipt_to_admin(update, context, ord_rec)
+            return
+
     if not doc.file_name.lower().endswith(".xlsx"):
         await update.message.reply_text("⚠️ لطفاً فقط فایل اکسل با پسوند `.xlsx` ارسال کنید.")
         return
@@ -1841,12 +1980,13 @@ async def handle_excel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"❌ خطا در خواندن فایل اکسل: {e}")
 
 
-async def send_invoice_pdf(
+async def send_vip_direct_invoice_pdf(
     chat_id: int,
     order_data: dict,
     context: ContextTypes.DEFAULT_TYPE,
     extra_note: str = None,
 ):
+    """ارسال مستقیم فاکتور / پیش‌فاکتور با تمام دکمه‌های تغییر فوری برای کاربرانی که رمز ۵ رقمی را وارد کرده‌اند"""
     order_mode = order_data.get("order_mode", get_user_order_mode(chat_id))
     apply_order_mode_pricing_to_items(order_data["items"], order_mode=order_mode)
 
@@ -1860,7 +2000,7 @@ async def send_invoice_pdf(
     mode_label = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
 
     caption = (
-        f"📄 **{doc_type} سفارش {cust}**\n"
+        f"📄 **{doc_type} سفارش {cust}** (صدور مستقیم VIP)\n"
         f"🏷 نوع سفارش: `{mode_label}`\n"
         f"📅 تاریخ: `{to_fa_num(order_data['date'])}`\n"
         f"📦 تعداد کل: `{to_fa_num(total_qty)}` دست ({to_fa_num(len(order_data['items']))} ردیف)\n"
@@ -1905,25 +2045,319 @@ async def send_invoice_pdf(
     )
 
 
+async def send_customer_proforma_pdf(
+    chat_id: int,
+    order_data: dict,
+    context: ContextTypes.DEFAULT_TYPE,
+    extra_note: str = None,
+    auto_switched_notice: str = "",
+):
+    """
+    ارسال «پیش‌فاکتور» برای مشتریان عادی (فاکتور نهایی تا قبل از تایید مهندس اکبری و تایید رسید پرداخت صادر نمی‌شود)
+    """
+    global ORDER_COUNTER
+    ORDER_COUNTER += 1
+    oid = str(ORDER_COUNTER)
+
+    order_data["doc_type"] = "پیش‌فاکتور"
+    order_mode = order_data.get("order_mode", get_user_order_mode(chat_id))
+    apply_order_mode_pricing_to_items(order_data["items"], order_mode=order_mode)
+
+    pdf_bytes = generate_pdf_bytes(order_data)
+    cust = order_data["customer_title"]
+    filename = f"پیش‌فاکتور سفارش {cust}.pdf"
+
+    total_payable = sum(i["qty"] * i["unit_price"] for i in order_data["items"])
+    total_qty = sum(i["qty"] for i in order_data["items"])
+    mode_label = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
+
+    ACTIVE_PAYMENT_ORDERS[oid] = {
+        "order_id": oid,
+        "order_data": order_data,
+        "customer_chat_id": chat_id,
+        "status": "proforma_issued",
+        "created_at": get_today_jalali(),
+    }
+    USER_ACTIVE_ORDER_ID[chat_id] = oid
+
+    caption = ""
+    if auto_switched_notice:
+        caption += f"{auto_switched_notice}\n\n"
+
+    caption += (
+        f"📄 **پیش‌فاکتور سفارش {cust}**\n"
+        f"🔢 کد پیگیری سفارش: `#{to_fa_num(oid)}`\n"
+        f"🏷 نوع سفارش: `{mode_label}`\n"
+        f"📅 تاریخ: `{to_fa_num(order_data['date'])}`\n"
+        f"📦 تعداد کل: `{to_fa_num(total_qty)}` دست ({to_fa_num(len(order_data['items']))} ردیف)\n"
+        f"💰 مبلغ قابل پرداخت: `{to_fa_num(total_payable, comma=True)} ریال`\n"
+        f"📎 پیوست صفحه ۲: `جدول راهنمای کاربرد و اشتراکات لنت‌ها`\n\n"
+        "📌 **مراحل نهایی‌سازی سفارش و دریافت فاکتور رسمی:**\n"
+        "۱. در صورت مورد تایید بودن پیش‌فاکتور بالا، دکمه **«✅ تایید پیش‌فاکتور و ارسال برای مدیریت جهت پرداخت»** را بزنید.\n"
+        "۲. پس از تایید مدیریت، اطلاعات حساب و شماره کارت برای شما ارسال می‌شود.\n"
+        "۳. پس از واریز وجه و ارسال تصویر رسید، **فاکتور نهایی** به همراه **زمان تحویل بار** برایتان صادر می‌گردد."
+    )
+
+    if order_data.get("warnings"):
+        caption += "\n\n⚠️ **تذکر:**\n" + "\n".join(f"• {w}" for w in order_data["warnings"])
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ تایید پیش‌فاکتور و ارسال برای مدیریت جهت پرداخت",
+                    callback_data=f"cust_submit_proforma:{oid}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "✏️ اصلاح اقلام پیش‌فاکتور", callback_data="reopen_last_order_edit"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏠 بازگشت به منوی اصلی", callback_data="back_to_main_menu"
+                )
+            ],
+        ]
+    )
+
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=io.BytesIO(pdf_bytes),
+        filename=filename,
+        caption=caption,
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+async def forward_receipt_to_admin(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, ord_rec: dict
+):
+    """ارسال رسید پرداخت مشتری برای مهندس شروین اکبری (ID: 84838606) جهت تایید و صدور فاکتور نهایی"""
+    oid = ord_rec["order_id"]
+    order_data = ord_rec["order_data"]
+    cust = order_data["customer_title"]
+    total_payable = sum(i["qty"] * i["unit_price"] for i in order_data["items"])
+    total_qty = sum(i["qty"] for i in order_data["items"])
+    user = update.effective_user
+    user_tag = f"@{user.username}" if (user and user.username) else f"ID: {user.id if user else ord_rec['customer_chat_id']}"
+    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() if user else ""
+
+    ord_rec["status"] = "receipt_sent_to_admin"
+
+    admin_caption = (
+        f"💳 **رسید پرداخت جدید برای سفارش `#{to_fa_num(oid)}`**\n\n"
+        f"👤 **مشتری:** `{cust}`\n"
+        f"📱 **اکانت تلگرام:** {full_name} ({user_tag})\n"
+        f"📦 **تعداد کل:** `{to_fa_num(total_qty)} دست`\n"
+        f"💰 **مبلغ پیش‌فاکتور:** `{to_fa_num(total_payable, comma=True)} ریال`\n\n"
+        "👇 در صورت تایید واریز وجه، دکمه زیر را بزنید تا توضیحات زمان تحویل را وارد کرده و **فاکتور نهایی** برای مشتری ارسال شود:"
+    )
+    admin_kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ تایید پرداخت و صدور فاکتور نهایی + زمان تحویل",
+                    callback_data=f"adm_approve_pay:{oid}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ رد رسید پرداخت", callback_data=f"adm_reject_pay:{oid}"
+                )
+            ],
+        ]
+    )
+
+    try:
+        if update.message.photo:
+            photo_id = update.message.photo[-1].file_id
+            await context.bot.send_photo(
+                chat_id=ADMIN_TELEGRAM_ID,
+                photo=photo_id,
+                caption=admin_caption,
+                parse_mode="Markdown",
+                reply_markup=admin_kb,
+            )
+        elif update.message.document:
+            doc_id = update.message.document.file_id
+            await context.bot.send_document(
+                chat_id=ADMIN_TELEGRAM_ID,
+                document=doc_id,
+                caption=admin_caption,
+                parse_mode="Markdown",
+                reply_markup=admin_kb,
+            )
+        else:
+            txt_receipt = update.message.text or update.message.caption or "رسید متنی"
+            await context.bot.send_message(
+                chat_id=ADMIN_TELEGRAM_ID,
+                text=admin_caption + f"\n\n📝 **توضیحات رسید مشتری:**\n`{txt_receipt}`",
+                parse_mode="Markdown",
+                reply_markup=admin_kb,
+            )
+
+        await update.message.reply_text(
+            f"✅ **رسید پرداخت سفارش `#{to_fa_num(oid)}` با موفقیت دریافت شد و برای مدیریت ({ADMIN_USERNAME}) ارسال گردید.**\n\n"
+            "⏳ پس از بررسی و تایید تراکنش توسط مدیریت، **فاکتور نهایی** به همراه **زمان تحویل بار** در همین چت برای شما ارسال خواهد شد.",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.exception("Error forwarding receipt to admin")
+        await update.message.reply_text(
+            f"⚠️ خطا در ارسال رسید برای مدیر: `{e}`\nلطفاً مطمئن شوید مدیر ({ADMIN_USERNAME}) حداقل یک بار ربات را `/start` کرده است.",
+            parse_mode="Markdown",
+        )
+
+
 async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global RUNTIME_PAYMENT_BANK_INFO
     user_text = update.message.text.strip()
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else chat_id
 
-    # ۱. بررسی کلیک روی دکمه «سفارش عمده»
+    # ۰. بررسی اینکه آیا مدیر (مهندس شروین اکبری) در حال وارد کردن «توضیحات زمان تحویل» یا «شماره کارت سفارشی» است
+    if user_id == ADMIN_TELEGRAM_ID and chat_id in ADMIN_STATE:
+        adm_st = ADMIN_STATE.pop(chat_id)
+        st_mode = adm_st.get("mode")
+        oid = adm_st.get("order_id")
+        ord_rec = ACTIVE_PAYMENT_ORDERS.get(oid)
+
+        if not ord_rec:
+            await update.message.reply_text("⚠️ این سفارش در حافظه یافت نشد.")
+            return
+
+        if st_mode == "awaiting_custom_bank":
+            RUNTIME_PAYMENT_BANK_INFO = user_text
+            cust_chat_id = ord_rec["customer_chat_id"]
+            ord_rec["status"] = "awaiting_receipt"
+            USER_ACTIVE_ORDER_ID[cust_chat_id] = oid
+            total_payable = sum(i["qty"] * i["unit_price"] for i in ord_rec["order_data"]["items"])
+
+            await context.bot.send_message(
+                chat_id=cust_chat_id,
+                text=(
+                    f"✅ **پیش‌فاکتور سفارش `#{to_fa_num(oid)}` شما توسط مدیریت تایید شد!**\n\n"
+                    f"💰 **مبلغ قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`\n\n"
+                    f"💳 **اطلاعات حساب و شماره کارت جهت واریز:**\n{user_text}\n\n"
+                    "📸 **لطفاً پس از واریز وجه، تصویر رسید پرداخت خود را در همین چت ارسال فرمایید تا فاکتور نهایی و زمان تحویل برایتان صادر شود.**"
+                ),
+                parse_mode="Markdown",
+            )
+            await update.message.reply_text(
+                f"✅ اطلاعات پرداخت برای مشتری (`{ord_rec['order_data']['customer_title']}`) ارسال شد و سیستم منتظر دریافت رسید از مشتری است.",
+                parse_mode="Markdown",
+            )
+            return
+
+        elif st_mode == "awaiting_delivery_note":
+            delivery_note = user_text
+            cust_chat_id = ord_rec["customer_chat_id"]
+            order_data = ord_rec["order_data"]
+            order_data["doc_type"] = "فاکتور"
+            ord_rec["status"] = "completed"
+            USER_ACTIVE_ORDER_ID.pop(cust_chat_id, None)
+
+            wait_adm = await update.message.reply_text("⏳ در حال صدور و ارسال فاکتور نهایی برای مشتری...")
+            try:
+                pdf_bytes = generate_pdf_bytes(order_data)
+                cust = order_data["customer_title"]
+                filename = f"فاکتور سفارش {cust}.pdf"
+                total_payable = sum(i["qty"] * i["unit_price"] for i in order_data["items"])
+                total_qty = sum(i["qty"] for i in order_data["items"])
+
+                final_caption = (
+                    f"🎉 **فاکتور نهایی سفارش {cust}** (تسویه شده)\n"
+                    f"🔢 کد سفارش: `#{to_fa_num(oid)}`\n"
+                    f"📅 تاریخ: `{to_fa_num(order_data['date'])}`\n"
+                    f"📦 تعداد کل: `{to_fa_num(total_qty)}` دست\n"
+                    f"💰 مبلغ کل: `{to_fa_num(total_payable, comma=True)} ریال`\n\n"
+                    f"🚚 **توضیحات مدیریت بابت زمان و نحوه تحویل بار:**\n"
+                    f"« {delivery_note} »\n\n"
+                    "🙏 با تشکر از خرید و اعتماد شما به **شرکت کیالنت البرز نور**"
+                )
+                await context.bot.send_document(
+                    chat_id=cust_chat_id,
+                    document=io.BytesIO(pdf_bytes),
+                    filename=filename,
+                    caption=final_caption,
+                    parse_mode="Markdown",
+                )
+                await wait_adm.edit_text(
+                    f"✅ **فاکتور نهایی سفارش `#{to_fa_num(oid)}`** به همراه توضیحات زمان تحویل با موفقیت برای مشتری (`{cust}`) ارسال شد!",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.exception("Error sending final invoice to customer")
+                await wait_adm.edit_text(f"❌ خطا در ارسال فاکتور نهایی به مشتری: `{e}`", parse_mode="Markdown")
+            return
+
+    # ۱. بررسی کلیک روی دکمه «🔐 وارد کردن رمز» یا ارسال رمز ۵ رقمی در حالت انتظار
+    if user_text in (BTN_VIP_CODE_TEXT, "🔓 حالت ویژه فعال است", "رمز", "وارد کردن رمز"):
+        expected_code = get_expected_vip_code(user_id)
+        if is_user_vip(user_id):
+            await update.message.reply_text(
+                "🔓 **حالت ویژه (صدور مستقیم فاکتور و پیش‌فاکتور بدون نیاز به پرداخت) برای شما فعال است!**\n"
+                "می‌توانید مستقیماً سفارش خود را بفرستید.",
+                parse_mode="Markdown",
+                reply_markup=get_main_reply_keyboard(user_id=user_id),
+            )
+            return
+        AWAITING_VIP_CODE_USERS.add(chat_id)
+        await update.message.reply_text(
+            "🔐 **ورود به بخش صدور مستقیم فاکتور:**\n\n"
+            "لطفاً **رمز ۵ رقمی اختصاصی** خود را وارد نمایید:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🏠 انصراف و بازگشت به منوی اصلی", callback_data="back_to_main_menu")]]
+            ),
+        )
+        return
+
+    if chat_id in AWAITING_VIP_CODE_USERS:
+        entered = to_en_str(user_text).strip()
+        expected = get_expected_vip_code(user_id)
+        if entered == expected:
+            AWAITING_VIP_CODE_USERS.discard(chat_id)
+            VIP_UNLOCKED_USERS.add(user_id)
+            await update.message.reply_text(
+                "✅ **رمز صحیح است! دسترسی ویژه برای شما فعال شد.**\n\n"
+                "از این لحظه:\n"
+                "• می‌توانید مستقیماً **فاکتور** و **پیش‌فاکتور** را بدون مراحل پرداخت و تایید دریافت کنید.\n"
+                "• قیمت‌های سفارش عمده نیز در پیش‌نمایش برای شما نمایش داده می‌شود.",
+                parse_mode="Markdown",
+                reply_markup=get_main_reply_keyboard(user_id=user_id),
+            )
+            return
+        else:
+            await update.message.reply_text(
+                "❌ **رمز وارد شده اشتباه است.** لطفاً مجدداً رمز ۵ رقمی را وارد کنید یا به منوی اصلی بازگردید:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🏠 بازگشت به منوی اصلی", callback_data="back_to_main_menu")]]
+                ),
+            )
+            return
+
+    # ۲. بررسی کلیک روی دکمه «سفارش عمده»
     if user_text in (BTN_WHOLESALE_TEXT, "سفارش عمده", "عمده"):
         USER_ORDER_MODES[chat_id] = "wholesale"
         AWAITING_QUESTION_MODE.discard(chat_id)
         USER_EDIT_STATE.pop(chat_id, None)
         await update.message.reply_text(
             "✅ بخش **«📦 سفارش عمده»** انتخاب شد.\n"
-            "📌 **توجه:** حداقل خرید عمده، **یک کارتن یا معادل ۱۰ دست لنت** می‌باشد و **تمامی سفارشات نقدی تسویه می‌شوند**.\n\n"
+            "📌 **توجه:**\n"
+            "• **حداقل خرید عمده، ۲ کارتن یا معادل ۲۰ دست لنت می‌باشد** (سفارش‌های کمتر از ۱۵ دست، سفارش عمده محسوب نمی‌شوند و به سفارش خرد منتقل می‌شوند).\n"
+            "• **تمامی سفارشات به صورت نقدی تسویه می‌شوند.**\n\n"
             "حالا می‌توانید سفارش خود را به صورت **متن، ویس یا عکس** ارسال فرمایید.",
             parse_mode="Markdown",
-            reply_markup=get_main_reply_keyboard(),
+            reply_markup=get_main_reply_keyboard(user_id=user_id),
         )
         return
 
-    # ۲. بررسی کلیک روی دکمه «سفارش خرد»
+    # ۳. بررسی کلیک روی دکمه «سفارش خرد»
     if user_text in (BTN_RETAIl_TEXT, "سفارش خرد", "خرد"):
         USER_ORDER_MODES[chat_id] = "retail"
         AWAITING_QUESTION_MODE.discard(chat_id)
@@ -1933,11 +2367,11 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📌 **توجه:** **تمامی سفارشات به صورت نقدی تسویه می‌شوند.**\n\n"
             "حالا می‌توانید سفارش خود را به صورت **متن، ویس یا عکس** ارسال فرمایید.",
             parse_mode="Markdown",
-            reply_markup=get_main_reply_keyboard(),
+            reply_markup=get_main_reply_keyboard(user_id=user_id),
         )
         return
 
-    # ۳. بررسی کلیک روی دکمه «اگر سوالی داری ازم بپرس»
+    # ۴. بررسی کلیک روی دکمه «اگر سوالی داری ازم بپرس»
     if user_text in (BTN_ASK_QUESTION_TEXT, "سوال", "سوال فنی", "اشتراکات لنت"):
         AWAITING_QUESTION_MODE.add(chat_id)
         USER_EDIT_STATE.pop(chat_id, None)
@@ -1949,15 +2383,17 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• _«برای پژو ۲۰۷ یا تیگو ۷ چه لنتی دارید و اشتراکاتش چیه؟»_\n\n"
             "✍️ لطفاً سوال خود را تایپ کنید:",
             parse_mode="Markdown",
-            reply_markup=get_main_reply_keyboard(),
+            reply_markup=get_main_reply_keyboard(user_id=user_id),
         )
         return
 
-    # ۴. بررسی اینکه آیا کاربر در حال وارد کردن «عدد دلخواه تعداد» یا «افزودن لنت جدید» در منوی اصلاح است
+    # ۵. بررسی اینکه آیا کاربر در حال وارد کردن «عدد دلخواه تعداد» یا «افزودن لنت جدید» در منوی اصلاح است
     edit_state = USER_EDIT_STATE.get(chat_id)
     if edit_state and chat_id in PENDING_DRAFT_ORDERS:
         draft = PENDING_DRAFT_ORDERS[chat_id]
         state_mode = edit_state.get("mode")
+        vip_flag = is_user_vip(user_id)
+        hide_prices = (draft.get("order_mode") == "wholesale") and (not vip_flag)
 
         if state_mode == "awaiting_qty":
             idx = edit_state.get("item_idx", 0)
@@ -1971,9 +2407,9 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 has_5_6, _, _ = has_two_backing_plate_models(draft["items"][idx]["row_id"], catalog)
                 await update.message.reply_text(
                     f"✅ تعداد ردیف {to_fa_num(idx + 1)} به **{to_fa_num(new_qty)} دست** تغییر یافت.\n\n"
-                    + format_single_item_edit_text(draft["items"][idx], idx, len(draft["items"]), has_5_6),
+                    + format_single_item_edit_text(draft["items"][idx], idx, len(draft["items"]), has_5_6, hide_prices=hide_prices),
                     parse_mode="Markdown",
-                    reply_markup=get_single_item_edit_keyboard(draft["items"][idx], idx, catalog),
+                    reply_markup=get_single_item_edit_keyboard(draft["items"][idx], idx, catalog, is_vip=vip_flag),
                 )
                 return
             else:
@@ -1991,46 +2427,48 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not added_items:
                     await wait_add.edit_text(
                         "⚠️ لنتی از متن شما تشخیص داده نشد. لطفاً دوباره از منوی زیر امتحان کنید:",
-                        reply_markup=get_draft_edit_list_keyboard(draft),
+                        reply_markup=get_draft_edit_list_keyboard(draft, is_vip=vip_flag),
                     )
                     return
                 draft["items"].extend(added_items)
                 await wait_add.edit_text(
                     f"✅ **{to_fa_num(len(added_items))} ردیف لنت جدید** به سفارش اضافه شد!\n\n"
-                    + format_draft_order_summary(draft),
+                    + format_draft_order_summary(draft, is_vip=vip_flag),
                     parse_mode="Markdown",
-                    reply_markup=get_draft_edit_list_keyboard(draft),
+                    reply_markup=get_draft_edit_list_keyboard(draft, is_vip=vip_flag),
                 )
             except Exception as e:
                 await wait_add.edit_text(
                     f"❌ خطا در افزودن لنت: `{e}`",
                     parse_mode="Markdown",
-                    reply_markup=get_draft_edit_list_keyboard(draft),
+                    reply_markup=get_draft_edit_list_keyboard(draft, is_vip=vip_flag),
                 )
             return
 
-    # ۵. اگر کاربر در حالت ویرایش متن ویس نبود، بررسی می‌کنیم آیا پیامش سوال فنی/استعلام اشتراکات است
+    # ۶. اگر کاربر در حالت ویرایش متن ویس نبود، بررسی می‌کنیم آیا پیامش سوال فنی/استعلام اشتراکات است
     was_editing_voice = chat_id in AWAITING_VOICE_EDIT
     if not was_editing_voice and (
         chat_id in AWAITING_QUESTION_MODE or is_question_or_catalog_inquiry(user_text)
     ):
         AWAITING_QUESTION_MODE.discard(chat_id)
         order_mode = get_user_order_mode(chat_id)
+        vip_flag = is_user_vip(user_id)
         wait_qa = await update.message.reply_text("🔍 در حال بررسی کاتالوگ جامع و اشتراکات لنت‌ها...")
         try:
             catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
-            answer = answer_catalog_question(user_text, catalog, order_mode=order_mode)
+            answer = answer_catalog_question(user_text, catalog, order_mode=order_mode, is_vip=vip_flag)
             await wait_qa.edit_text(answer)
         except Exception as e:
             logger.exception("Error answering catalog question")
             await wait_qa.edit_text(f"❌ خطا در دریافت پاسخ:\n`{e}`", parse_mode="Markdown")
         return
 
-    # ۶. استخراج سفارش و نمایش پیش‌نمایش اقلام همراه با ۳ دکمه (تایید / اصلاح / بازگشت به منوی اصلی)
+    # ۷. استخراج سفارش و نمایش پیش‌نمایش اقلام همراه با ۳ دکمه (تایید / اصلاح / بازگشت به منوی اصلی)
     AWAITING_VOICE_EDIT.discard(chat_id)
     PENDING_VOICE_TEXTS.pop(chat_id, None)
 
     order_mode = get_user_order_mode(chat_id)
+    vip_flag = is_user_vip(user_id)
     mode_short = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
     cleaned_text = normalize_automotive_stt_text(user_text)
     wait_msg = await update.message.reply_text(
@@ -2050,11 +2488,17 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if was_editing_voice:
             order_data["extra_note"] = cleaned_text
 
+        # بررسی قانون حداقل ۱۵ دست برای سفارش عمده
+        auto_notice = enforce_wholesale_minimum_rule(order_data, chat_id)
+        summary_txt = format_draft_order_summary(order_data, is_vip=vip_flag)
+        if auto_notice:
+            summary_txt = f"{auto_notice}\n\n{summary_txt}"
+
         PENDING_DRAFT_ORDERS[chat_id] = order_data
         await wait_msg.edit_text(
-            format_draft_order_summary(order_data),
+            summary_txt,
             parse_mode="Markdown",
-            reply_markup=get_draft_summary_keyboard(),
+            reply_markup=get_draft_summary_keyboard(is_vip=vip_flag),
         )
 
     except Exception as e:
@@ -2063,10 +2507,6 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_voice_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    دریافت ویس، تبدیل به متن با دقت بالا + اصلاح اصطلاحات لنت («باشیم» -> «با شیم» و...)
-    و نمایش متن به کاربر برای تایید قبل از ارسال به هوش مصنوعی
-    """
     chat_id = update.effective_chat.id
     voice = update.message.voice or update.message.audio
     caption = update.message.caption or ""
@@ -2119,7 +2559,7 @@ async def handle_voice_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"`{transcribed}`\n\n"
             f"🏷 **نوع سفارش فعلی:** `{get_order_mode_label(current_mode)}`\n\n"
             "❓ **آیا این متن مورد تایید است؟**\n"
-            "_(پس از تایید، لیست لنت‌های تشخیص داده شده نیز قبل از صدور فاکتور به شما نمایش داده می‌شود تا بتوانید تعداد، شیم یا ۵/۶ میل بودن هر لنت را با دکمه تغییر دهید)_"
+            "_(پس از تایید، لیست لنت‌های تشخیص داده شده نیز قبل از صدور پیش‌فاکتور به شما نمایش داده می‌شود تا بتوانید تعداد، شیم یا ۵/۶ میل بودن هر لنت را با دکمه تغییر دهید)_"
         )
         await wait_msg.edit_text(
             confirm_msg,
@@ -2134,10 +2574,21 @@ async def handle_voice_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_photo_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else chat_id
     photo = update.message.photo[-1]
     caption = update.message.caption or ""
 
+    # ۱. بررسی اینکه آیا مشتری در مرحله ارسال «تصویر رسید پرداخت» است
+    active_oid = USER_ACTIVE_ORDER_ID.get(chat_id)
+    if active_oid and active_oid in ACTIVE_PAYMENT_ORDERS:
+        ord_rec = ACTIVE_PAYMENT_ORDERS[active_oid]
+        if ord_rec.get("status") == "awaiting_receipt":
+            await forward_receipt_to_admin(update, context, ord_rec)
+            return
+
+    # ۲. در غیر این صورت، عکس به عنوان تصویر برگ سفارش لنت پردازش می‌شود
     order_mode = get_user_order_mode(chat_id)
+    vip_flag = is_user_vip(user_id)
     mode_short = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
     wait_msg = await update.message.reply_text(
         f"🖼 در حال خواندن تصویر سفارش ({mode_short}) و تشخیص لنت‌ها..."
@@ -2158,11 +2609,16 @@ async def handle_photo_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
 
+        auto_notice = enforce_wholesale_minimum_rule(order_data, chat_id)
+        summary_txt = format_draft_order_summary(order_data, is_vip=vip_flag)
+        if auto_notice:
+            summary_txt = f"{auto_notice}\n\n{summary_txt}"
+
         PENDING_DRAFT_ORDERS[chat_id] = order_data
         await wait_msg.edit_text(
-            format_draft_order_summary(order_data),
+            summary_txt,
             parse_mode="Markdown",
-            reply_markup=get_draft_summary_keyboard(),
+            reply_markup=get_draft_summary_keyboard(is_vip=vip_flag),
         )
 
     except Exception as e:
@@ -2174,6 +2630,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat_id
+    user_id = update.effective_user.id if update.effective_user else chat_id
+    vip_flag = is_user_vip(user_id)
     data = query.data or ""
 
     # ۱. بازگشت به منوی اصلی
@@ -2181,27 +2639,57 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         PENDING_VOICE_TEXTS.pop(chat_id, None)
         AWAITING_VOICE_EDIT.discard(chat_id)
         AWAITING_QUESTION_MODE.discard(chat_id)
+        AWAITING_VIP_CODE_USERS.discard(chat_id)
         USER_EDIT_STATE.pop(chat_id, None)
         PENDING_DRAFT_ORDERS.pop(chat_id, None)
         current_mode = get_user_order_mode(chat_id)
+        welcome_txt = (
+            build_welcome_text(user_id=user_id)
+            + f"\n\n🔘 **حالت فعلی شما:** `{get_order_mode_label(current_mode)}`"
+        )
+        if query.message.document or query.message.photo:
+            await query.message.reply_text(
+                welcome_txt,
+                parse_mode="Markdown",
+                reply_markup=get_start_mode_inline_keyboard(current_mode, user_id=user_id),
+            )
+        else:
+            await query.edit_message_text(
+                welcome_txt,
+                parse_mode="Markdown",
+                reply_markup=get_start_mode_inline_keyboard(current_mode, user_id=user_id),
+            )
+        return
+
+    # ۲. دکمه وارد کردن رمز ۵ رقمی در منوی اصلی
+    if data == "enter_vip_password":
+        if vip_flag:
+            await query.message.reply_text(
+                "🔓 **حالت ویژه (صدور مستقیم فاکتور بدون نیاز به پرداخت) برای شما فعال است!**",
+                parse_mode="Markdown",
+            )
+            return
+        AWAITING_VIP_CODE_USERS.add(chat_id)
         await query.edit_message_text(
-            build_welcome_text()
-            + f"\n\n🔘 **حالت فعلی شما:** `{get_order_mode_label(current_mode)}`",
+            "🔐 **ورود به بخش صدور مستقیم فاکتور:**\n\n"
+            "لطفاً **رمز ۵ رقمی اختصاصی** خود را در چت تایپ و ارسال نمایید:",
             parse_mode="Markdown",
-            reply_markup=get_start_mode_inline_keyboard(current_mode),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🏠 انصراف و بازگشت به منوی اصلی", callback_data="back_to_main_menu")]]
+            ),
         )
         return
 
-    # ۲. تغییر حالت سفارش عمده / خرد
+    # ۳. تغییر حالت سفارش عمده / خرد
     if data == "set_mode_wholesale":
         USER_ORDER_MODES[chat_id] = "wholesale"
         AWAITING_QUESTION_MODE.discard(chat_id)
         await query.edit_message_text(
             "✅ بخش **«📦 سفارش عمده»** انتخاب شد.\n"
-            "📌 حداقل خرید عمده، **یک کارتن یا معادل ۱۰ دست لنت** می‌باشد و **تمامی سفارشات نقدی تسویه می‌شوند**.\n\n"
+            "📌 **حداقل خرید عمده، ۲ کارتن یا معادل ۲۰ دست لنت می‌باشد** (سفارش‌های کمتر از ۱۵ دست، سفارش عمده محسوب نمی‌شوند و به سفارش خرد منتقل می‌شوند) و **تمامی سفارشات نقدی تسویه می‌شوند**.\n\n"
             "لطفاً سفارش خود را به صورت متن، ویس یا عکس ارسال فرمایید.",
             parse_mode="Markdown",
-            reply_markup=get_start_mode_inline_keyboard("wholesale"),
+            reply_markup=get_start_mode_inline_keyboard("wholesale", user_id=user_id),
         )
         return
 
@@ -2213,7 +2701,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📌 **تمامی سفارشات به صورت نقدی تسویه می‌شوند.**\n\n"
             "لطفاً سفارش خود را به صورت متن، ویس یا عکس ارسال فرمایید.",
             parse_mode="Markdown",
-            reply_markup=get_start_mode_inline_keyboard("retail"),
+            reply_markup=get_start_mode_inline_keyboard("retail", user_id=user_id),
         )
         return
 
@@ -2227,11 +2715,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• _«برای پژو ۲۰۷ یا تیگو ۷ چه لنتی دارید و اشتراکاتش چیه؟»_\n\n"
             "✍️ لطفاً سوال خود را بنویسید:",
             parse_mode="Markdown",
-            reply_markup=get_main_reply_keyboard(),
+            reply_markup=get_main_reply_keyboard(user_id=user_id),
         )
         return
 
-    # ۳. تایید متن ویس -> استخراج لنت‌ها و نمایش پیش‌نمایش اقلام
+    # ۴. تایید متن ویس -> استخراج لنت‌ها و نمایش پیش‌نمایش اقلام
     if data == "confirm_voice_order":
         transcribed = PENDING_VOICE_TEXTS.pop(chat_id, None)
         AWAITING_VOICE_EDIT.discard(chat_id)
@@ -2259,11 +2747,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             order_data["extra_note"] = transcribed
+            auto_notice = enforce_wholesale_minimum_rule(order_data, chat_id)
+            summary_txt = format_draft_order_summary(order_data, is_vip=vip_flag)
+            if auto_notice:
+                summary_txt = f"{auto_notice}\n\n{summary_txt}"
+
             PENDING_DRAFT_ORDERS[chat_id] = order_data
             await query.edit_message_text(
-                format_draft_order_summary(order_data),
+                summary_txt,
                 parse_mode="Markdown",
-                reply_markup=get_draft_summary_keyboard(),
+                reply_markup=get_draft_summary_keyboard(is_vip=vip_flag),
             )
         except Exception as e:
             logger.exception("Error extracting draft order from confirmed voice")
@@ -2289,7 +2782,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ سفارش صوتی لغو شد. می‌توانید مجدداً ویس یا پیام متنی بفرستید.")
         return
 
-    # ۴. مدیریت پیش‌نمایش و منوی اصلاح اقلام سفارش (PENDING_DRAFT_ORDERS)
+    # ۵. مدیریت پیش‌نمایش و منوی اصلاح اقلام سفارش (PENDING_DRAFT_ORDERS)
     if data == "reopen_last_order_edit":
         last_ord = LAST_ORDERS.get(chat_id)
         if not last_ord:
@@ -2302,7 +2795,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✏️ **لیست لنت‌های سفارش جهت اصلاح:**\n"
             "روی هر لنت کلیک کنید تا **تعداد**، **با شیم / بدون شیم** یا **۵ میل / ۶ میل** بودن آن را تغییر دهید:",
             parse_mode="Markdown",
-            reply_markup=get_draft_edit_list_keyboard(draft),
+            reply_markup=get_draft_edit_list_keyboard(draft, is_vip=vip_flag),
         )
         return
 
@@ -2313,40 +2806,239 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ هیچ لنتی در سفارش وجود ندارد. لطفاً سفارش جدید ارسال کنید.")
             return
 
-        order_mode = draft.get("order_mode", get_user_order_mode(chat_id))
-        total_qty = sum(i["qty"] for i in draft["items"])
-        # پاکسازی هشدارهای قبلی تعداد عمده و بررسی مجدد
-        draft["warnings"] = [
-            w for w in draft.get("warnings", []) if "حداقل خرید عمده" not in w
-        ]
-        if order_mode == "wholesale" and total_qty < 10:
-            draft["warnings"].append(
-                f"حداقل خرید عمده ۱ کارتن (۱۰ دست لنت) می‌باشد (تعداد فعلی این فاکتور: {to_fa_num(total_qty)} دست)."
-            )
+        # اعمال قانون حداقل ۱۵ دست برای سفارش عمده قبل از صدور پیش‌فاکتور/فاکتور
+        auto_notice = enforce_wholesale_minimum_rule(draft, chat_id)
 
-        await query.edit_message_text("⏳ در حال ساخت فایل PDF دو صفحه‌ای فاکتور و جدول اشتراکات...")
-        try:
-            LAST_ORDERS[chat_id] = draft
-            await send_invoice_pdf(
-                chat_id, draft, context, extra_note=draft.get("extra_note")
-            )
-            await query.message.delete()
-        except Exception as e:
-            logger.exception("Error generating final PDF")
-            await query.edit_message_text(f"❌ خطا در ساخت PDF:\n`{e}`", parse_mode="Markdown")
+        if vip_flag:
+            await query.edit_message_text("⏳ در حال ساخت فایل PDF دو صفحه‌ای (حالت ویژه VIP)...")
+            try:
+                LAST_ORDERS[chat_id] = draft
+                await send_vip_direct_invoice_pdf(
+                    chat_id, draft, context, extra_note=draft.get("extra_note")
+                )
+                await query.message.delete()
+            except Exception as e:
+                logger.exception("Error generating VIP PDF")
+                await query.edit_message_text(f"❌ خطا در ساخت PDF:\n`{e}`", parse_mode="Markdown")
+        else:
+            await query.edit_message_text("⏳ در حال صدور پیش‌فاکتور رسمی دو صفحه‌ای...")
+            try:
+                LAST_ORDERS[chat_id] = draft
+                await send_customer_proforma_pdf(
+                    chat_id,
+                    draft,
+                    context,
+                    extra_note=draft.get("extra_note"),
+                    auto_switched_notice=auto_notice,
+                )
+                await query.message.delete()
+            except Exception as e:
+                logger.exception("Error generating customer proforma PDF")
+                await query.edit_message_text(f"❌ خطا در ساخت پیش‌فاکتور:\n`{e}`", parse_mode="Markdown")
         return
 
+    # ۶. ارسال پیش‌فاکتور تاییدشده توسط مشتری برای مدیر (مهندس شروین اکبری - ID: 84838606)
+    if data.startswith("cust_submit_proforma:"):
+        oid = data.split(":")[1]
+        ord_rec = ACTIVE_PAYMENT_ORDERS.get(oid)
+        if not ord_rec:
+            await query.message.reply_text("⚠️ اطلاعات این پیش‌فاکتور در حافظه یافت نشد. لطفاً مجدداً سفارش را ثبت کنید.")
+            return
+
+        if ord_rec.get("status") not in ("proforma_issued",):
+            await query.answer("این پیش‌فاکتور قبلاً برای مدیریت ارسال شده است.", show_alert=True)
+            return
+
+        ord_rec["status"] = "pending_admin_proforma_approval"
+        order_data = ord_rec["order_data"]
+        order_data["doc_type"] = "پیش‌فاکتور"
+        cust = order_data["customer_title"]
+        total_payable = sum(i["qty"] * i["unit_price"] for i in order_data["items"])
+        total_qty = sum(i["qty"] for i in order_data["items"])
+        mode_label = "سفارش خرد" if order_data.get("order_mode") == "retail" else "سفارش عمده"
+
+        user = update.effective_user
+        user_tag = f"@{user.username}" if (user and user.username) else f"ID: {user.id if user else chat_id}"
+        full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() if user else ""
+
+        try:
+            pdf_bytes = generate_pdf_bytes(order_data)
+            admin_caption = (
+                f"🔔 **درخواست تایید پیش‌فاکتور جدید `#{to_fa_num(oid)}`**\n\n"
+                f"👤 **نام مشتری:** `{cust}`\n"
+                f"📱 **تلگرام مشتری:** {full_name} ({user_tag})\n"
+                f"🏷 **نوع سفارش:** `{mode_label}`\n"
+                f"📦 **تعداد کل:** `{to_fa_num(total_qty)}` دست ({to_fa_num(len(order_data['items']))} ردیف)\n"
+                f"💰 **مبلغ قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`\n\n"
+                "👇 در صورت تایید، دکمه زیر را بزنید تا اطلاعات حساب و شماره کارت برای مشتری ارسال شود:"
+            )
+            admin_kb = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ تایید پیش‌فاکتور و ارسال شماره کارت پیش‌فرض",
+                            callback_data=f"adm_approve_proforma:{oid}",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "✍️ تایید و تایپ شماره کارت / حساب دلخواه",
+                            callback_data=f"adm_custom_bank:{oid}",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "❌ رد پیش‌فاکتور", callback_data=f"adm_reject_proforma:{oid}"
+                        )
+                    ],
+                ]
+            )
+            await context.bot.send_document(
+                chat_id=ADMIN_TELEGRAM_ID,
+                document=io.BytesIO(pdf_bytes),
+                filename=f"پیش‌فاکتور {cust} - کد {oid}.pdf",
+                caption=admin_caption,
+                parse_mode="Markdown",
+                reply_markup=admin_kb,
+            )
+            await query.message.reply_text(
+                f"✅ **پیش‌فاکتور شما (کد `#{to_fa_num(oid)}`) با موفقیت برای مدیریت ({ADMIN_USERNAME}) ارسال شد.**\n\n"
+                "⏳ لطفاً منتظر بمانید؛ به محض تایید مدیریت، **شماره کارت و اطلاعات پرداخت** در همین چت برای شما ارسال خواهد شد.",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.exception("Error sending proforma to admin")
+            ord_rec["status"] = "proforma_issued"
+            await query.message.reply_text(
+                f"⚠️ خطا در ارسال پیش‌فاکتور برای مدیریت: `{e}`\n"
+                f"لطفاً مطمئن شوید اکانت مدیریت ({ADMIN_USERNAME}) ربات را استارت کرده است.",
+                parse_mode="Markdown",
+            )
+        return
+
+    # ۷. دکمه‌های پنل مدیریت (مهندس شروین اکبری - ID: 84838606)
+    if data.startswith("adm_approve_proforma:"):
+        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+            await query.answer("⛔ فقط مدیر سیستم مجاز به تایید است.", show_alert=True)
+            return
+        oid = data.split(":")[1]
+        ord_rec = ACTIVE_PAYMENT_ORDERS.get(oid)
+        if not ord_rec:
+            await query.message.reply_text("⚠️ این سفارش در حافظه یافت نشد.")
+            return
+
+        ord_rec["status"] = "awaiting_receipt"
+        cust_chat_id = ord_rec["customer_chat_id"]
+        USER_ACTIVE_ORDER_ID[cust_chat_id] = oid
+        total_payable = sum(i["qty"] * i["unit_price"] for i in ord_rec["order_data"]["items"])
+
+        await context.bot.send_message(
+            chat_id=cust_chat_id,
+            text=(
+                f"✅ **پیش‌فاکتور سفارش `#{to_fa_num(oid)}` شما توسط مدیریت تایید شد!**\n\n"
+                f"💰 **مبلغ قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`\n\n"
+                f"{RUNTIME_PAYMENT_BANK_INFO}\n\n"
+                "📸 **لطفاً پس از واریز وجه، تصویر رسید پرداخت خود را در همین چت ارسال فرمایید تا پس از تایید، فاکتور نهایی و زمان تحویل بار برایتان صادر گردد.**"
+            ),
+            parse_mode="Markdown",
+        )
+        await query.message.reply_text(
+            f"✅ پیش‌فاکتور `#{to_fa_num(oid)}` تایید شد و اطلاعات حساب/کارت برای مشتری (`{ord_rec['order_data']['customer_title']}`) ارسال گردید."
+        )
+        return
+
+    if data.startswith("adm_custom_bank:"):
+        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+            await query.answer("⛔ فقط مدیر سیستم مجاز به این عملیات است.", show_alert=True)
+            return
+        oid = data.split(":")[1]
+        ord_rec = ACTIVE_PAYMENT_ORDERS.get(oid)
+        if not ord_rec:
+            await query.message.reply_text("⚠️ این سفارش در حافظه یافت نشد.")
+            return
+
+        ADMIN_STATE[chat_id] = {"mode": "awaiting_custom_bank", "order_id": oid}
+        await query.message.reply_text(
+            f"💳 لطفاً **شماره کارت، شماره حساب و نام صاحب حساب** را برای ارسال به مشتری سفارش `#{to_fa_num(oid)}` تایپ و ارسال کنید:",
+            parse_mode="Markdown",
+        )
+        return
+
+    if data.startswith("adm_reject_proforma:"):
+        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+            await query.answer("⛔ فقط مدیر سیستم مجاز است.", show_alert=True)
+            return
+        oid = data.split(":")[1]
+        ord_rec = ACTIVE_PAYMENT_ORDERS.pop(oid, None)
+        if ord_rec:
+            cust_chat_id = ord_rec["customer_chat_id"]
+            USER_ACTIVE_ORDER_ID.pop(cust_chat_id, None)
+            await context.bot.send_message(
+                chat_id=cust_chat_id,
+                text=(
+                    f"⚠️ پیش‌فاکتور شماره `#{to_fa_num(oid)}` مورد تایید مدیریت قرار نگرفت.\n"
+                    f"جهت هماهنگی بیشتر می‌توانید با مدیریت ({ADMIN_USERNAME}) در ارتباط باشید."
+                ),
+                parse_mode="Markdown",
+            )
+            await query.message.reply_text(f"❌ پیش‌فاکتور `#{to_fa_num(oid)}` رد شد و به مشتری اطلاع داده شد.")
+        return
+
+    if data.startswith("adm_approve_pay:"):
+        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+            await query.answer("⛔ فقط مدیر سیستم مجاز به تایید پرداخت است.", show_alert=True)
+            return
+        oid = data.split(":")[1]
+        ord_rec = ACTIVE_PAYMENT_ORDERS.get(oid)
+        if not ord_rec:
+            await query.message.reply_text("⚠️ این سفارش در حافظه یافت نشد.")
+            return
+
+        ADMIN_STATE[chat_id] = {"mode": "awaiting_delivery_note", "order_id": oid}
+        await query.message.reply_text(
+            f"✅ پرداخت سفارش `#{to_fa_num(oid)}` (`{ord_rec['order_data']['customer_title']}`) تایید شد.\n\n"
+            "🚚 **لطفاً اکنون توضیحات خود بابت زمان و نحوه تحویل بار را تایپ و ارسال کنید**\n"
+            "_(به محض ارسال متن شما، فاکتور نهایی رسمی به همراه توضیحات تحویل برای مشتری ارسال می‌شود)_:",
+            parse_mode="Markdown",
+        )
+        return
+
+    if data.startswith("adm_reject_pay:"):
+        if user_id != ADMIN_TELEGRAM_ID and not vip_flag:
+            await query.answer("⛔ فقط مدیر سیستم مجاز است.", show_alert=True)
+            return
+        oid = data.split(":")[1]
+        ord_rec = ACTIVE_PAYMENT_ORDERS.get(oid)
+        if ord_rec:
+            ord_rec["status"] = "awaiting_receipt"
+            cust_chat_id = ord_rec["customer_chat_id"]
+            await context.bot.send_message(
+                chat_id=cust_chat_id,
+                text=(
+                    f"⚠️ رسید ارسالی برای سفارش `#{to_fa_num(oid)}` مورد تایید قرار نگرفت.\n"
+                    "لطفاً تصویر واضح رسید پرداخت را مجدداً ارسال فرمایید یا با مدیریت هماهنگ کنید."
+                ),
+                parse_mode="Markdown",
+            )
+            await query.message.reply_text(f"❌ رسید سفارش `#{to_fa_num(oid)}` رد شد و از مشتری خواسته شد مجدداً ارسال کند.")
+        return
+
+    # ۸. منوی اصلاح اقلام در پیش‌نمایش
     if data == "draft_edit_menu":
         draft = PENDING_DRAFT_ORDERS.get(chat_id)
         USER_EDIT_STATE.pop(chat_id, None)
         if not draft:
             await query.edit_message_text("⚠️ سفارش فعلی منقضی شده است. لطفاً مجدداً سفارش را ارسال کنید.")
             return
+        auto_notice = enforce_wholesale_minimum_rule(draft, chat_id)
+        summary_txt = format_draft_order_summary(draft, is_vip=vip_flag)
+        if auto_notice:
+            summary_txt = f"{auto_notice}\n\n{summary_txt}"
         await query.edit_message_text(
-            format_draft_order_summary(draft)
+            summary_txt
             + "\n\n👇 **روی هر لنت کلیک کنید تا آن را ویرایش کنید، یا لنت جدید اضافه نمایید:**",
             parse_mode="Markdown",
-            reply_markup=get_draft_edit_list_keyboard(draft),
+            reply_markup=get_draft_edit_list_keyboard(draft, is_vip=vip_flag),
         )
         return
 
@@ -2367,7 +3059,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ۵. کلیک روی یک لنت خاص برای ویرایش (edit_item:IDX)
     if data.startswith("edit_item:"):
         draft = PENDING_DRAFT_ORDERS.get(chat_id)
         USER_EDIT_STATE.pop(chat_id, None)
@@ -2377,22 +3068,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         idx = int(data.split(":")[1])
         if not (0 <= idx < len(draft["items"])):
             await query.edit_message_text(
-                format_draft_order_summary(draft),
+                format_draft_order_summary(draft, is_vip=vip_flag),
                 parse_mode="Markdown",
-                reply_markup=get_draft_edit_list_keyboard(draft),
+                reply_markup=get_draft_edit_list_keyboard(draft, is_vip=vip_flag),
             )
             return
         catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
         item = draft["items"][idx]
         has_5_6, _, _ = has_two_backing_plate_models(item["row_id"], catalog)
+        hide_prices = (draft.get("order_mode") == "wholesale") and (not vip_flag)
         await query.edit_message_text(
-            format_single_item_edit_text(item, idx, len(draft["items"]), has_5_6),
+            format_single_item_edit_text(item, idx, len(draft["items"]), has_5_6, hide_prices=hide_prices),
             parse_mode="Markdown",
-            reply_markup=get_single_item_edit_keyboard(item, idx, catalog),
+            reply_markup=get_single_item_edit_keyboard(item, idx, catalog, is_vip=vip_flag),
         )
         return
 
-    # ۶. تغییر تعداد با دکمه‌های +1/-1/+5/-5/+10/-10 (item_qty:IDX:DELTA)
     if data.startswith("item_qty:"):
         draft = PENDING_DRAFT_ORDERS.get(chat_id)
         if not draft:
@@ -2405,14 +3096,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             draft["items"][idx]["qty"] = new_q
             catalog = load_catalog_from_excel(EXCEL_FILE_PATH)
             has_5_6, _, _ = has_two_backing_plate_models(draft["items"][idx]["row_id"], catalog)
+            hide_prices = (draft.get("order_mode") == "wholesale") and (not vip_flag)
             await query.edit_message_text(
-                format_single_item_edit_text(draft["items"][idx], idx, len(draft["items"]), has_5_6),
+                format_single_item_edit_text(draft["items"][idx], idx, len(draft["items"]), has_5_6, hide_prices=hide_prices),
                 parse_mode="Markdown",
-                reply_markup=get_single_item_edit_keyboard(draft["items"][idx], idx, catalog),
+                reply_markup=get_single_item_edit_keyboard(draft["items"][idx], idx, catalog, is_vip=vip_flag),
             )
         return
 
-    # ۷. درخواست تایپ عدد دلخواه برای تعداد (item_custom_qty:IDX)
     if data.startswith("item_custom_qty:"):
         draft = PENDING_DRAFT_ORDERS.get(chat_id)
         if not draft:
@@ -2430,7 +3121,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # ۸. تغییر وضعیت با شیم / بدون شیم (item_shim:IDX:0_OR_1)
     if data.startswith("item_shim:"):
         draft = PENDING_DRAFT_ORDERS.get(chat_id)
         if not draft:
@@ -2453,14 +3143,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     matched, curr_item["qty"], want_shim, order_mode=order_mode
                 )
             has_5_6, _, _ = has_two_backing_plate_models(draft["items"][idx]["row_id"], catalog)
+            hide_prices = (draft.get("order_mode") == "wholesale") and (not vip_flag)
             await query.edit_message_text(
-                format_single_item_edit_text(draft["items"][idx], idx, len(draft["items"]), has_5_6),
+                format_single_item_edit_text(draft["items"][idx], idx, len(draft["items"]), has_5_6, hide_prices=hide_prices),
                 parse_mode="Markdown",
-                reply_markup=get_single_item_edit_keyboard(draft["items"][idx], idx, catalog),
+                reply_markup=get_single_item_edit_keyboard(draft["items"][idx], idx, catalog, is_vip=vip_flag),
             )
         return
 
-    # ۹. تغییر ضخامت کفشک ۵ میل / ۶ میل (item_thick:IDX:5_OR_6)
     if data.startswith("item_thick:"):
         draft = PENDING_DRAFT_ORDERS.get(chat_id)
         if not draft:
@@ -2477,14 +3167,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 draft["items"][idx] = build_single_verified_item(
                     target_row, curr_item["qty"], curr_item.get("with_shim", False), order_mode=order_mode
                 )
+            hide_prices = (draft.get("order_mode") == "wholesale") and (not vip_flag)
             await query.edit_message_text(
-                format_single_item_edit_text(draft["items"][idx], idx, len(draft["items"]), has_5_6),
+                format_single_item_edit_text(draft["items"][idx], idx, len(draft["items"]), has_5_6, hide_prices=hide_prices),
                 parse_mode="Markdown",
-                reply_markup=get_single_item_edit_keyboard(draft["items"][idx], idx, catalog),
+                reply_markup=get_single_item_edit_keyboard(draft["items"][idx], idx, catalog, is_vip=vip_flag),
             )
         return
 
-    # ۱۰. حذف یک لنت از لیست سفارش (item_del:IDX)
     if data.startswith("item_del:"):
         draft = PENDING_DRAFT_ORDERS.get(chat_id)
         if not draft:
@@ -2494,15 +3184,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             removed = draft["items"].pop(idx)
             await query.answer(f"🗑 «{removed['base_name']}» حذف شد.")
             await query.edit_message_text(
-                format_draft_order_summary(draft)
+                format_draft_order_summary(draft, is_vip=vip_flag)
                 + "\n\n👇 **روی هر لنت کلیک کنید تا آن را ویرایش کنید، یا لنت جدید اضافه نمایید:**",
                 parse_mode="Markdown",
-                reply_markup=get_draft_edit_list_keyboard(draft),
+                reply_markup=get_draft_edit_list_keyboard(draft, is_vip=vip_flag),
             )
         return
 
-    # ۱۱. تبدیل فوری فاکتور <-> پیش‌فاکتور یا عمده <-> خرد روی PDF صادرشده
+    # ۹. تبدیل فوری فاکتور <-> پیش‌فاکتور (فقط برای کاربران دارای رمز VIP)
     if data == "toggle_doctype":
+        if not vip_flag:
+            await query.answer("🔒 دریافت مستقیم فاکتور بدون تایید پرداخت فقط با وارد کردن رمز امکان‌پذیر است.", show_alert=True)
+            return
         order_data = LAST_ORDERS.get(chat_id)
         if not order_data:
             await query.message.reply_text(
@@ -2513,10 +3206,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_data["doc_type"] = (
             "فاکتور" if order_data["doc_type"] == "پیش‌فاکتور" else "پیش‌فاکتور"
         )
-        await send_invoice_pdf(chat_id, order_data, context)
+        await send_vip_direct_invoice_pdf(chat_id, order_data, context)
         return
 
     if data == "toggle_ordermode":
+        if not vip_flag:
+            await query.answer("🔒 این قابلیت مخصوص حالت ویژه (رمزدار) است.", show_alert=True)
+            return
         order_data = LAST_ORDERS.get(chat_id)
         if not order_data:
             await query.message.reply_text(
@@ -2528,7 +3224,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_data["order_mode"] = new_mode
         USER_ORDER_MODES[chat_id] = new_mode
         apply_order_mode_pricing_to_items(order_data["items"], order_mode=new_mode)
-        await send_invoice_pdf(chat_id, order_data, context)
+        await send_vip_direct_invoice_pdf(chat_id, order_data, context)
         return
 
 
@@ -2597,6 +3293,7 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("setbank", set_bank_cmd))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_excel_upload))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice_order))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_order))
