@@ -59,6 +59,16 @@ PAYMENT_BANK_INFO = os.getenv(
 # مسیر فایل اکسل لیست قیمت (می‌توانید فایل اکسل جدید را مستقیم در تلگرام هم برای ربات بفرستید)
 EXCEL_FILE_PATH = os.getenv("EXCEL_FILE_PATH", "New Microsoft Excel Worksheet.xlsx")
 
+# لینک گوگل‌شیت لیست قیمت کارخانه و درصدهای حسابداری مدیر
+# مدیر ۲۰٪ از لیست قیمت کارخانه تخفیف می‌گیرد (ضریب ۰.۸۰) و ۲۱٪ به لیست قیمت کارخانه برای فروش عمده اضافه می‌کند (ضریب ۱.۲۱)
+FACTORY_GSHEET_ID = os.getenv("FACTORY_GSHEET_ID", "1qlfMgTG87xxgaeZ7TdWqviUFk46WKjdxrOkCHIPdl1M")
+FACTORY_GSHEET_GID = os.getenv("FACTORY_GSHEET_GID", "1085253456")
+FACTORY_GSHEET_URL = f"https://docs.google.com/spreadsheets/d/{FACTORY_GSHEET_ID}/edit?gid={FACTORY_GSHEET_GID}#gid={FACTORY_GSHEET_GID}"
+FACTORY_GSHEET_XLSX_URL = f"https://docs.google.com/spreadsheets/d/{FACTORY_GSHEET_ID}/export?format=xlsx&gid={FACTORY_GSHEET_GID}"
+FACTORY_DISCOUNT_PCT = 20.0   # ۲۰٪ تخفیف خرید مدیر از کارخانه
+ADMIN_MARKUP_PCT = 21.0       # ۲۱٪ افزایش روی لیست قیمت کارخانه برای فروش عمده
+ACCOUNTING_DB_PATH = os.getenv("ACCOUNTING_DB_PATH", "accounting_orders_db.json")
+
 # تصاویر خوش‌آمدگویی لنت‌ها (می‌توانید در تلگرام عکس را با کپشن /addwelcome بفرستید،
 # یا file_id / لینک / نام فایل عکس‌ها را با کاما در متغیر محیطی WELCOME_PHOTOS قرار دهید)
 WELCOME_PHOTOS_ENV = os.getenv("WELCOME_PHOTOS", "").strip()
@@ -500,16 +510,78 @@ def parse_admin_discount_input(raw_text: str, mode: str, subtotal: int) -> tuple
         return "amount", amt
 
 
+def normalize_factory_and_wholesale_price(raw_price: int, is_raw_factory_sheet: bool = False) -> tuple:
+    """
+    محاسبه دقیق (قیمت لیست کارخانه، قیمت عمده با +۲۱٪، قیمت خرید از کارخانه با ۲۰٪ تخفیف):
+    - اگر ورودی از گوگل‌شیت کارخانه باشد (یا مضرب رند ۱۰,۰۰۰ ریال باشد که تقسیم بر ۱.۲۱ رند نیست):
+      * قیمت لیست کارخانه = raw_price
+      * قیمت فروش عمده (+۲۱٪) = round(factory_price * 1.21)
+    - اگر ورودی از فایل اکسلی باشد که قبلاً ۲۱٪ روی آن اعمال شده (مثل 8,082,800 که تقسیم بر 1.21 دقیقاً 6,680,000 می‌شود):
+      * قیمت لیست کارخانه = round(raw_price / 1.21)
+      * قیمت فروش عمده (+۲۱٪) = raw_price
+    - قیمت تسویه مدیر با کارخانه (۲۰٪ تخفیف از لیست کارخانه) = round(factory_price * 0.80)
+    خروجی: (factory_list_price, wholesale_price, factory_payable_price)
+    """
+    if raw_price is None:
+        return None, None, None
+    p = int(round(float(raw_price)))
+    if p <= 0:
+        return None, None, None
+
+    div_121 = int(round(p / (1.0 + ADMIN_MARKUP_PCT / 100.0)))
+    if not is_raw_factory_sheet and (p % 1000 != 0) and (div_121 % 1000 == 0):
+        factory_price = div_121
+        wholesale_price = p
+    else:
+        factory_price = p
+        wholesale_price = int(round(factory_price * (1.0 + ADMIN_MARKUP_PCT / 100.0)))
+
+    factory_payable_price = int(round(factory_price * (1.0 - FACTORY_DISCOUNT_PCT / 100.0)))
+    return factory_price, wholesale_price, factory_payable_price
+
+
+def get_item_factory_prices(item: dict) -> tuple:
+    """
+    دریافت (قیمت واحد لیست کارخانه، قیمت واحد تسویه با کارخانه با ۲۰٪ تخفیف) برای یک آیتم سفارش
+    """
+    f_list = item.get("factory_unit_price")
+    f_pay = item.get("factory_payable_unit_price")
+    if f_list and f_pay:
+        return int(f_list), int(f_pay)
+
+    base_w = item.get("base_unit_price") or item.get("unit_price") or 0
+    f_list_calc, _, f_pay_calc = normalize_factory_and_wholesale_price(base_w, is_raw_factory_sheet=False)
+    f_list_calc = f_list_calc or 0
+    f_pay_calc = f_pay_calc or 0
+    item["factory_unit_price"] = f_list_calc
+    item["factory_payable_unit_price"] = f_pay_calc
+    return f_list_calc, f_pay_calc
+
+
 def calculate_order_financials(items: list, order_data: dict = None) -> dict:
     """
     محاسبه دقیق مبالغ سفارش شامل:
     - جمع کل تعداد (total_qty)
-    - جمع کل قبل از تخفیف (subtotal)
-    - تخفیف دستی اعمال‌شده توسط مدیر (بر اساس درصد دلخواه یا مبلغ دلخواه)
-    - مبلغ نهایی قابل پرداخت پس از کسر تخفیف (total_payable)
+    - جمع کل قبل از تخفیف مشتری (subtotal)
+    - تخفیف دستی اعمال‌شده توسط مدیر برای مشتری (discount_amount)
+    - مبلغ نهایی قابل پرداخت توسط مشتری (total_payable)
+    - جمع کل به قیمت لیست کارخانه (factory_list_total)
+    - مبلغ ۲۰٪ تخفیف دریافتی مدیر از کارخانه (factory_discount_amount)
+    - مبلغ قابل پرداخت مدیر به کارخانه با ۲۰٪ تخفیف (factory_payable_total)
+    - سود خالص مدیر از این سفارش (net_profit = total_payable - factory_payable_total)
     """
     total_qty = sum(int(it.get("qty", 0)) for it in items)
     subtotal = sum(int(it.get("qty", 0)) * int(it.get("unit_price", 0)) for it in items)
+
+    factory_list_total = 0
+    factory_payable_total = 0
+    for it in items:
+        q = int(it.get("qty", 0))
+        f_list, f_pay = get_item_factory_prices(it)
+        factory_list_total += q * f_list
+        factory_payable_total += q * f_pay
+
+    factory_discount_amount = max(0, factory_list_total - factory_payable_total)
 
     discount_pct = 0.0
     discount_amount = 0
@@ -528,6 +600,8 @@ def calculate_order_financials(items: list, order_data: dict = None) -> dict:
             discount_label = "تخفیف توافقی"
 
     total_payable = max(0, subtotal - discount_amount)
+    net_profit = total_payable - factory_payable_total
+
     return {
         "total_qty": total_qty,
         "subtotal": subtotal,
@@ -535,6 +609,10 @@ def calculate_order_financials(items: list, order_data: dict = None) -> dict:
         "discount_amount": discount_amount,
         "discount_label": discount_label,
         "total_payable": total_payable,
+        "factory_list_total": factory_list_total,
+        "factory_discount_amount": factory_discount_amount,
+        "factory_payable_total": factory_payable_total,
+        "net_profit": net_profit,
     }
 
 
@@ -877,8 +955,11 @@ def load_catalog_from_excel(excel_path: str):
             except ValueError:
                 return None
 
-        p_no = parse_price(price_no_shim)
-        p_yes = parse_price(price_with_shim)
+        raw_no = parse_price(price_no_shim)
+        raw_yes = parse_price(price_with_shim)
+
+        f_no, w_no, fpay_no = normalize_factory_and_wholesale_price(raw_no)
+        f_yes, w_yes, fpay_yes = normalize_factory_and_wholesale_price(raw_yes)
 
         r_id_str = str(row_id).strip()
         name_str = str(name).strip()
@@ -899,12 +980,41 @@ def load_catalog_from_excel(excel_path: str):
                 "row_id": r_id_str,
                 "wva": str(wva).strip(),
                 "name": name_str,
-                "price_no_shim": p_no,
-                "price_with_shim": p_yes,
+                "price_no_shim": w_no,
+                "price_with_shim": w_yes,
+                "factory_price_no_shim": f_no,
+                "factory_price_with_shim": f_yes,
+                "factory_payable_no_shim": fpay_no,
+                "factory_payable_with_shim": fpay_yes,
                 "box_qty": box_q,
             }
         )
     return catalog
+
+
+def sync_catalog_from_factory_gsheet(target_excel_path: str = None) -> tuple:
+    """
+    دریافت مستقیم لیست قیمت کارخانه از گوگل‌شیت رسمی:
+    https://docs.google.com/spreadsheets/d/1qlfMgTG87xxgaeZ7TdWqviUFk46WKjdxrOkCHIPdl1M/edit?gid=1085253456
+    و ذخیره‌سازی در فایل اکسل محلی (با محاسبه خودکار +۲۱٪ برای فروش عمده و -۲۰٪ برای تسویه کارخانه).
+    """
+    target_path = target_excel_path or EXCEL_FILE_PATH
+    try:
+        resp = requests.get(FACTORY_GSHEET_XLSX_URL, timeout=20)
+        if resp.status_code != 200:
+            return False, f"خطای HTTP {resp.status_code} در دریافت گوگل‌شیت کارخانه"
+        content_bytes = resp.content
+        wb_test = openpyxl.load_workbook(io.BytesIO(content_bytes), data_only=True)
+        ws_test = wb_test.active
+        if ws_test.max_row < 5:
+            return False, "فایل دریافتی از گوگل‌شیت خالی یا ناقص است."
+        with open(target_path, "wb") as f_out:
+            f_out.write(content_bytes)
+        cat = load_catalog_from_excel(target_path)
+        return True, f"لیست قیمت کارخانه با موفقیت از گوگل‌شیت بروزرسانی شد ({to_fa_num(len(cat))} ردیف کالا؛ اعمال خودکار +۲۱٪ فروش عمده و ۲۰٪ تخفیف کارخانه)."
+    except Exception as e:
+        logger.warning(f"Could not sync from Google Sheet: {e}")
+        return False, f"امکان اتصال مستقیم به گوگل‌شیت نبود ({e})؛ از آخرین فایل اکسل موجود استفاده می‌شود."
 
 
 def format_catalog_for_prompt(catalog) -> str:
@@ -1602,6 +1712,7 @@ def build_single_verified_item(matched: dict, qty: int, with_shim: bool, order_m
         display_name += " با شیم"
 
     box_q = matched.get("box_qty") or get_box_qty_for_item(matched["row_id"], matched["name"])
+    f_list, _, f_pay = normalize_factory_and_wholesale_price(base_unit_price)
     return {
         "row_id": matched["row_id"],
         "wva": matched["wva"],
@@ -1609,6 +1720,8 @@ def build_single_verified_item(matched: dict, qty: int, with_shim: bool, order_m
         "base_name": matched["name"],
         "qty": max(1, int(qty)),
         "box_qty": box_q,
+        "factory_unit_price": f_list or 0,
+        "factory_payable_unit_price": f_pay or 0,
         "base_unit_price": base_unit_price,
         "unit_price": final_unit_price,
         "markup_percent": markup_pct,
@@ -1692,6 +1805,7 @@ def validate_and_price_order(parsed: dict, catalog: list, source_text: str = "",
         if with_shim and "شیم" not in display_name:
             display_name += " با شیم"
 
+        f_list, _, f_pay = normalize_factory_and_wholesale_price(base_unit_price)
         verified_items.append(
             {
                 "row_id": matched["row_id"],
@@ -1700,6 +1814,8 @@ def validate_and_price_order(parsed: dict, catalog: list, source_text: str = "",
                 "base_name": matched["name"],
                 "qty": qty,
                 "box_qty": box_q,
+                "factory_unit_price": f_list or 0,
+                "factory_payable_unit_price": f_pay or 0,
                 "base_unit_price": base_unit_price,
                 "unit_price": final_unit_price,
                 "markup_percent": markup_pct,
@@ -2280,6 +2396,245 @@ BTN_WHOLESALE_TEXT = "📦 سفارش عمده"
 BTN_RETAIl_TEXT = "🛍 سفارش خرد"
 BTN_ASK_QUESTION_TEXT = "❓ اگر سوالی داری ازم بپرس (اشتراکات و لیست لنت‌ها)"
 BTN_VIP_CODE_TEXT = "🔐 وارد کردن رمز"
+BTN_ACCOUNTING_TEXT = "💼 بخش حسابداری (ویژه مدیر)"
+
+# بانک اطلاعات حسابداری مدیر (سفارش‌های باز، سفارشات تسویه‌نشده با کارخانه، بایگانی تسویه‌شده‌ها و آمار ماهانه)
+ACCOUNTING_ORDERS = {}           # oid -> dict(order_id, order_data, customer_chat_id, acc_status, created_at, paid_at, settled_at, settlement_batch_id)
+ADMIN_SELECTED_SETTLE_OIDS = set()  # مجموعه‌ای از oid سفارش‌های انتخاب‌شده توسط مدیر برای تسویه تجمیعی با کارخانه
+SETTLEMENT_BATCH_COUNTER = 5000
+
+JALALI_MONTH_NAMES = {
+    1: "فروردین",
+    2: "اردیبهشت",
+    3: "خرداد",
+    4: "تیر",
+    5: "مرداد",
+    6: "شهریور",
+    7: "مهر",
+    8: "آبان",
+    9: "آذر",
+    10: "دی",
+    11: "بهمن",
+    12: "اسفند",
+}
+
+
+def load_accounting_db():
+    """بارگذاری دیتابیس حسابداری از فایل JSON روی دیسک تا با ری‌استارت سرور اطلاعات حفظ شود"""
+    global ORDER_COUNTER, SETTLEMENT_BATCH_COUNTER
+    if not os.path.exists(ACCOUNTING_DB_PATH):
+        return
+    try:
+        with open(ACCOUNTING_DB_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        orders_map = data.get("orders") or {}
+        for oid, rec in orders_map.items():
+            ACCOUNTING_ORDERS[str(oid)] = rec
+            if str(oid) not in ACTIVE_PAYMENT_ORDERS:
+                ACTIVE_PAYMENT_ORDERS[str(oid)] = rec
+            try:
+                num_id = int(str(oid))
+                if num_id > ORDER_COUNTER:
+                    ORDER_COUNTER = num_id
+            except Exception:
+                pass
+        saved_batch = data.get("settlement_batch_counter", 5000)
+        if isinstance(saved_batch, int) and saved_batch > SETTLEMENT_BATCH_COUNTER:
+            SETTLEMENT_BATCH_COUNTER = saved_batch
+        logger.info(f"✅ دیتابیس حسابداری بارگذاری شد ({len(ACCOUNTING_ORDERS)} سفارش).")
+    except Exception as e:
+        logger.warning(f"Could not load accounting DB: {e}")
+
+
+def save_accounting_db():
+    """ذخیره آنی وضعیت سفارش‌های باز، تسویه‌نشده و بایگانی در فایل JSON"""
+    try:
+        payload = {
+            "order_counter": ORDER_COUNTER,
+            "settlement_batch_counter": SETTLEMENT_BATCH_COUNTER,
+            "orders": ACCOUNTING_ORDERS,
+        }
+        with open(ACCOUNTING_DB_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"Could not save accounting DB: {e}")
+
+
+def register_or_update_accounting_order(
+    oid: str,
+    order_data: dict,
+    customer_chat_id: int,
+    default_acc_status: str = "open",
+    customer_user_tag: str = "",
+    customer_full_name: str = "",
+) -> dict:
+    """
+    ثبت یا بروزرسانی سفارش در سیستم حسابداری مدیر:
+    - هر پیش‌فاکتور جدید به صورت خودکار وارد «سفارش‌های باز» (acc_status = 'open') می‌شود.
+    """
+    oid = str(oid)
+    order_data["order_id"] = oid
+    for it in order_data.get("items", []):
+        get_item_factory_prices(it)
+
+    existing = ACCOUNTING_ORDERS.get(oid)
+    if existing:
+        existing["order_data"] = order_data
+        if customer_chat_id:
+            existing["customer_chat_id"] = customer_chat_id
+        if customer_user_tag:
+            existing["customer_user_tag"] = customer_user_tag
+        if customer_full_name:
+            existing["customer_full_name"] = customer_full_name
+        rec = existing
+    else:
+        rec = {
+            "order_id": oid,
+            "order_data": order_data,
+            "customer_chat_id": customer_chat_id,
+            "customer_user_tag": customer_user_tag,
+            "customer_full_name": customer_full_name,
+            "status": "proforma_issued",
+            "acc_status": default_acc_status,  # "open" | "paid_unsettled" | "settled_archived"
+            "created_at": order_data.get("date") or get_today_jalali(),
+            "paid_at": "",
+            "settled_at": "",
+            "settlement_batch_id": "",
+        }
+        ACCOUNTING_ORDERS[oid] = rec
+
+    ACTIVE_PAYMENT_ORDERS[oid] = rec
+    save_accounting_db()
+    return rec
+
+
+def get_orders_by_acc_status(acc_status: str) -> list:
+    """دریافت لیست سفارش‌ها بر اساس وضعیت حسابداری (مرتب‌شده از جدیدترین به قدیمی‌ترین)"""
+    res = [
+        rec for rec in ACCOUNTING_ORDERS.values()
+        if rec.get("acc_status", "open") == acc_status and rec.get("order_data", {}).get("items")
+    ]
+    res.sort(key=lambda r: int(str(r.get("order_id", "0"))) if str(r.get("order_id", "0")).isdigit() else 0, reverse=True)
+    return res
+
+
+def extract_jalali_year_month(date_str: str) -> str:
+    """استخراج سال و ماه شمسی به فرمت YYYY/MM از رشته تاریخ"""
+    s = to_en_str(str(date_str or "")).strip()
+    m = re.match(r"^(\d{4})[/\-](\d{1,2})", s)
+    if m:
+        yr = int(m.group(1))
+        mo = max(1, min(12, int(m.group(2))))
+        return f"{yr:04d}/{mo:02d}"
+    today = to_en_str(get_today_jalali())
+    return today[:7]
+
+
+def format_jalali_month_title(ym_str: str) -> str:
+    """تبدیل 1405/08 به «آبان ۱۴۰۵ (۱۴۰۵/۰۸)»"""
+    if ym_str == "all":
+        return "کل دوره‌ها (همه ماه‌ها)"
+    try:
+        parts = to_en_str(ym_str).split("/")
+        yr = int(parts[0])
+        mo = int(parts[1])
+        m_name = JALALI_MONTH_NAMES.get(mo, "")
+        return f"{m_name} {to_fa_num(yr)} ({to_fa_num(f'{yr:04d}/{mo:02d}')})"
+    except Exception:
+        return to_fa_num(ym_str)
+
+
+def shift_jalali_year_month(ym_str: str, delta_months: int) -> str:
+    """حرکت بین ماه‌های شمسی (ماه قبل / ماه بعد)"""
+    try:
+        parts = to_en_str(ym_str).split("/")
+        yr = int(parts[0])
+        mo = int(parts[1])
+        total_m = (yr * 12 + (mo - 1)) + delta_months
+        new_yr = total_m // 12
+        new_mo = (total_m % 12) + 1
+        return f"{new_yr:04d}/{new_mo:02d}"
+    except Exception:
+        return to_en_str(get_today_jalali())[:7]
+
+
+def generate_factory_settlement_pdf_bytes(selected_records: list, batch_id: str) -> tuple:
+    """
+    ساخت فاکتور تجمیعی تسویه با کارخانه (با اعمال ۲۰٪ تخفیف روی لیست قیمت کارخانه)
+    برای سفارش‌های انتخاب‌شده توسط مدیر.
+    خروجی: (pdf_bytes, summary_dict)
+    """
+    aggregated_map = {}  # (row_id, with_shim) -> item_dict
+    order_ids = []
+    customer_names = []
+    total_customer_revenue = 0
+    total_factory_list = 0
+    total_factory_payable = 0
+
+    for rec in selected_records:
+        oid = str(rec.get("order_id", ""))
+        order_ids.append(f"#{to_fa_num(oid)}")
+        od = rec.get("order_data", {})
+        c_title = od.get("customer_title", "مشتری")
+        if c_title not in customer_names:
+            customer_names.append(c_title)
+
+        fin = calculate_order_financials(od.get("items", []), order_data=od)
+        total_customer_revenue += fin["total_payable"]
+        total_factory_list += fin["factory_list_total"]
+        total_factory_payable += fin["factory_payable_total"]
+
+        for it in od.get("items", []):
+            f_list, f_pay = get_item_factory_prices(it)
+            key = (str(it.get("row_id", "")), bool(it.get("with_shim", False)))
+            if key not in aggregated_map:
+                aggregated_map[key] = {
+                    "row_id": it.get("row_id", ""),
+                    "wva": it.get("wva", ""),
+                    "name": it.get("name", ""),
+                    "base_name": it.get("base_name", it.get("name", "")),
+                    "qty": int(it.get("qty", 0)),
+                    "box_qty": it.get("box_qty") or get_box_qty_for_item(it.get("row_id", ""), it.get("name", "")),
+                    "factory_unit_price": f_list,
+                    "factory_payable_unit_price": f_pay,
+                    # در جدول فاکتور تسویه کارخانه، قیمت واحد را قیمت لیست کارخانه می‌گذاریم و در پایین جدول ۲۰٪ تخفیف همکاری را کسر می‌کنیم
+                    "base_unit_price": f_list,
+                    "unit_price": f_list,
+                    "with_shim": bool(it.get("with_shim", False)),
+                    "compatible_cars": it.get("compatible_cars") or get_compatible_vehicles_for_item(it.get("row_id", ""), it.get("name", "")),
+                }
+            else:
+                aggregated_map[key]["qty"] += int(it.get("qty", 0))
+
+    settlement_items = list(aggregated_map.values())
+    settlement_order_data = {
+        "doc_type": "فاکتور",
+        "order_mode": "wholesale",
+        "customer_title": f"تسویه کارخانه (شروین اکبری - سفارشات {', '.join(order_ids)})",
+        "date": get_today_jalali(),
+        "invoice_no": to_fa_num(batch_id),
+        "items": settlement_items,
+        "discount_type": "percent",
+        "discount_value": FACTORY_DISCOUNT_PCT,  # ۲۰٪ تخفیف کارخانه
+    }
+    pdf_bytes = generate_pdf_bytes(settlement_order_data)
+    total_factory_discount = max(0, total_factory_list - total_factory_payable)
+    net_profit = total_customer_revenue - total_factory_payable
+    carton_stats = calculate_order_cartons(settlement_items)
+
+    summary = {
+        "batch_id": batch_id,
+        "order_ids": order_ids,
+        "orders_count": len(selected_records),
+        "total_sets": carton_stats["total_sets"],
+        "carton_summary": carton_stats["summary_full"],
+        "total_customer_revenue": total_customer_revenue,
+        "total_factory_list": total_factory_list,
+        "total_factory_discount": total_factory_discount,
+        "total_factory_payable": total_factory_payable,
+        "net_profit": net_profit,
+    }
+    return pdf_bytes, summary
 
 
 def get_expected_vip_code(user_id: int) -> str:
@@ -2304,12 +2659,15 @@ def get_order_mode_label(order_mode: str) -> str:
 
 def get_main_reply_keyboard(user_id: int = None) -> ReplyKeyboardMarkup:
     vip_label = "🔓 حالت ویژه فعال است" if (user_id and is_user_vip(user_id)) else BTN_VIP_CODE_TEXT
+    rows = [
+        [KeyboardButton(BTN_WHOLESALE_TEXT), KeyboardButton(BTN_RETAIl_TEXT)],
+        [KeyboardButton(BTN_ASK_QUESTION_TEXT)],
+        [KeyboardButton(vip_label)],
+    ]
+    if user_id and int(user_id) == int(ADMIN_TELEGRAM_ID):
+        rows.insert(0, [KeyboardButton(BTN_ACCOUNTING_TEXT)])
     return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton(BTN_WHOLESALE_TEXT), KeyboardButton(BTN_RETAIl_TEXT)],
-            [KeyboardButton(BTN_ASK_QUESTION_TEXT)],
-            [KeyboardButton(vip_label)],
-        ],
+        rows,
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -2342,6 +2700,18 @@ def get_start_mode_inline_keyboard(current_mode: str, user_id: int = None) -> In
                 )
             ],
         ]
+        + (
+            [
+                [
+                    InlineKeyboardButton(
+                        "💼 بخش حسابداری و مدیریت سفارشات (ویژه مدیر)",
+                        callback_data="acc_dashboard",
+                    )
+                ]
+            ]
+            if (user_id and int(user_id) == int(ADMIN_TELEGRAM_ID))
+            else []
+        )
     )
 
 
@@ -2975,8 +3345,21 @@ async def send_vip_direct_invoice_pdf(
     extra_note: str = None,
 ):
     """ارسال مستقیم فاکتور / پیش‌فاکتور با تمام دکمه‌های تغییر فوری برای کاربرانی که رمز ۵ رقمی را وارد کرده‌اند"""
+    global ORDER_COUNTER
     order_mode = order_data.get("order_mode", get_user_order_mode(chat_id))
     apply_order_mode_pricing_to_items(order_data["items"], order_mode=order_mode)
+
+    oid = order_data.get("order_id")
+    if not oid:
+        ORDER_COUNTER += 1
+        oid = str(ORDER_COUNTER)
+        order_data["order_id"] = oid
+    register_or_update_accounting_order(
+        oid=str(oid),
+        order_data=order_data,
+        customer_chat_id=chat_id,
+        default_acc_status="open",
+    )
 
     pdf_bytes = generate_pdf_bytes(order_data)
     doc_type = order_data["doc_type"]
@@ -3032,7 +3415,7 @@ async def send_vip_direct_invoice_pdf(
             )
         ],
     ]
-    # دکمه‌های تخفیف درصدی و مبلغی فقط و فقط برای مدیر اصلی (ADMIN_TELEGRAM_ID) نمایش داده می‌شوند
+    # دکمه‌های تخفیف درصدی و مبلغی و دکمه «پرداخت گردید» فقط برای مدیر اصلی (ADMIN_TELEGRAM_ID) نمایش داده می‌شوند
     if int(chat_id) == int(ADMIN_TELEGRAM_ID):
         kb_rows.append(
             [
@@ -3048,6 +3431,25 @@ async def send_vip_direct_invoice_pdf(
             kb_rows.append(
                 [InlineKeyboardButton("🗑 حذف تخفیف", callback_data="vip_disc_clear")]
             )
+        acc_rec = ACCOUNTING_ORDERS.get(str(oid), {})
+        curr_acc_st = acc_rec.get("acc_status", "open")
+        if curr_acc_st == "open":
+            kb_rows.append(
+                [
+                    InlineKeyboardButton(
+                        "✅ پرداخت گردید (انتقال به تسویه‌نشده‌ها)",
+                        callback_data=f"acc_mark_paid:{oid}",
+                    )
+                ]
+            )
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    f"📂 مدیریت سفارش #{to_fa_num(oid)} در حسابداری",
+                    callback_data=f"acc_view_open:{oid}",
+                )
+            ]
+        )
     kb_rows.append(
         [
             InlineKeyboardButton(
@@ -3146,13 +3548,12 @@ async def send_customer_proforma_pdf(
     carton_stats = calculate_order_cartons(order_data["items"])
     mode_label = "سفارش خرد" if order_mode == "retail" else "سفارش عمده"
 
-    ACTIVE_PAYMENT_ORDERS[oid] = {
-        "order_id": oid,
-        "order_data": order_data,
-        "customer_chat_id": chat_id,
-        "status": "proforma_issued",
-        "created_at": get_today_jalali(),
-    }
+    register_or_update_accounting_order(
+        oid=oid,
+        order_data=order_data,
+        customer_chat_id=chat_id,
+        default_acc_status="open",
+    )
     USER_ACTIVE_ORDER_ID[chat_id] = oid
 
     price_lines = (
@@ -3278,8 +3679,23 @@ def build_admin_proforma_keyboard(oid: str, order_data: dict) -> InlineKeyboardM
             ],
             [
                 InlineKeyboardButton(
-                    "❌ رد پیش‌فاکتور", callback_data=f"adm_reject_proforma:{oid}"
-                )
+                    "📄 تبدیل به فاکتور",
+                    callback_data=f"acc_to_invoice:{oid}",
+                ),
+                InlineKeyboardButton(
+                    "✅ پرداخت گردید",
+                    callback_data=f"acc_mark_paid:{oid}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "✏️ اصلاح در سفارش‌های باز",
+                    callback_data=f"acc_edit_open:{oid}",
+                ),
+                InlineKeyboardButton(
+                    "❌ رد / حذف سفارش",
+                    callback_data=f"adm_reject_proforma:{oid}",
+                ),
             ],
         ]
     )
@@ -3310,15 +3726,21 @@ def build_admin_proforma_caption(oid: str, ord_rec: dict) -> str:
     else:
         price_block = f"💰 **مبلغ قابل پرداخت:** `{to_fa_num(total_payable, comma=True)} ریال`"
 
+    factory_list_total = fin["factory_list_total"]
+    factory_payable_total = fin["factory_payable_total"]
+    net_profit = fin["net_profit"]
     return (
-        f"🔔 **پیش‌فاکتور سفارش `#{to_fa_num(oid)}`**\n\n"
+        f"🔔 **پیش‌فاکتور سفارش `#{to_fa_num(oid)}` (ثبت‌شده در سفارش‌های باز)**\n\n"
         f"👤 **نام مشتری:** `{cust}`\n"
         f"📱 **تلگرام مشتری:** {full_name} ({user_tag})\n"
         f"🏷 **نوع سفارش:** `{mode_label}`\n"
         f"📦 **تعداد کل:** `{to_fa_num(total_qty)}` دست ({to_fa_num(len(order_data['items']))} ردیف)\n"
         f"📦 **معادل کارتن کیا:** `{carton_stats['summary_full']}`\n"
-        f"{price_block}\n\n"
-        "👇 می‌توانید قبل از تایید، **تخفیف به درصد دلخواه یا مبلغ دلخواه** اعمال کنید و سپس تایید را بزنید:"
+        f"{price_block}\n"
+        f"🏭 **قیمت لیست کارخانه:** `{to_fa_num(factory_list_total, comma=True)} ریال`\n"
+        f"💳 **پرداختی شما به کارخانه (۲۰٪ تخفیف):** `{to_fa_num(factory_payable_total, comma=True)} ریال`\n"
+        f"💎 **سود خالص شما از این سفارش:** `{to_fa_num(net_profit, comma=True)} ریال`\n\n"
+        "👇 می‌توانید قیمت را به عمده/خرد تغییر دهید، تخفیف اعمال کنید، یا وضعیت سفارش را مدیریت نمایید:"
     )
 
 
@@ -3404,6 +3826,645 @@ async def forward_receipt_to_admin(
         )
 
 
+
+# ==============================================================================
+# ۸.۵ توابع رابط کاربری بخش حسابداری انحصاری مدیر (سفارش‌های باز، تسویه‌نشده‌ها، بایگانی و آمار ماهانه)
+# ==============================================================================
+def build_accounting_dashboard_text_and_kb() -> tuple:
+    """داشبورد اصلی بخش حسابداری ویژه مدیر"""
+    open_list = get_orders_by_acc_status("open")
+    unsettled_list = get_orders_by_acc_status("paid_unsettled")
+    archived_list = get_orders_by_acc_status("settled_archived")
+
+    unsettled_cust_total = 0
+    unsettled_factory_payable = 0
+    unsettled_profit = 0
+    for rec in unsettled_list:
+        fin = calculate_order_financials(rec["order_data"]["items"], order_data=rec["order_data"])
+        unsettled_cust_total += fin["total_payable"]
+        unsettled_factory_payable += fin["factory_payable_total"]
+        unsettled_profit += fin["net_profit"]
+
+    curr_ym = extract_jalali_year_month(get_today_jalali())
+    month_profit = 0
+    month_orders_count = 0
+    for rec in ACCOUNTING_ORDERS.values():
+        od = rec.get("order_data", {})
+        if not od.get("items"):
+            continue
+        ym = extract_jalali_year_month(od.get("date") or rec.get("created_at"))
+        if ym == curr_ym:
+            month_orders_count += 1
+            if rec.get("acc_status") in ("paid_unsettled", "settled_archived"):
+                fin = calculate_order_financials(od["items"], order_data=od)
+                month_profit += fin["net_profit"]
+
+    txt = (
+        "💼 **پنل جامع حسابداری و مدیریت سفارشات (ویژه مدیر)**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"📐 **فرمول قیمت‌گذاری فعال:**\n"
+        f"• تخفیف خرید شما از لیست کارخانه: **`{to_fa_num(int(FACTORY_DISCOUNT_PCT))}٪`** (پرداخت `۸۰٪` لیست کارخانه)\n"
+        f"• افزایش قیمت فروش عمده شما روی لیست کارخانه: **`+{to_fa_num(int(ADMIN_MARKUP_PCT))}٪`**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"📂 **سفارش‌های باز (پیش‌فاکتورهای جاری):** `{to_fa_num(len(open_list))} سفارش`\n"
+        f"💳 **سفارشات پرداخت‌شده (تسویه‌نشده با کارخانه):** `{to_fa_num(len(unsettled_list))} سفارش`\n"
+        f"   🔹 بدهی فعلی به کارخانه (با ۲۰٪ تخفیف): `{to_fa_num(unsettled_factory_payable, comma=True)} ریال`\n"
+        f"   🔹 سود خالص شما در تسویه‌نشده‌ها: `{to_fa_num(unsettled_profit, comma=True)} ریال`\n"
+        f"🗄 **بایگانی سفارشات تسویه‌شده:** `{to_fa_num(len(archived_list))} سفارش`\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 **خلاصه ماه جاری ({format_jalali_month_title(curr_ym)}):**\n"
+        f"• کل سفارشات ثبت‌شده این ماه: `{to_fa_num(month_orders_count)} سفارش`\n"
+        f"• سود خالص قطعی این ماه: `{to_fa_num(month_profit, comma=True)} ریال` (`{to_fa_num(month_profit // 10, comma=True)} تومان`)\n\n"
+        "👇 لطفاً بخش مورد نظر خود را انتخاب کنید:"
+    )
+
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"📂 سفارش‌های باز ({to_fa_num(len(open_list))})",
+                    callback_data="acc_menu_open:0",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"💳 سفارشات تسویه‌نشده با کارخانه ({to_fa_num(len(unsettled_list))})",
+                    callback_data="acc_menu_unsettled:0",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"🗄 بایگانی سفارشات تسویه‌شده ({to_fa_num(len(archived_list))})",
+                    callback_data="acc_menu_archived:0",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📊 آمار و گزارش سود ماهانه (این ماه و ماه‌های قبل)",
+                    callback_data="acc_menu_stats:current",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔄 همگام‌سازی لیست قیمت از گوگل‌شیت کارخانه",
+                    callback_data="acc_sync_gsheet",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏠 بازگشت به منوی اصلی",
+                    callback_data="back_to_main_menu",
+                )
+            ],
+        ]
+    )
+    return txt, kb
+
+
+def build_open_orders_list_text_and_kb(page: int = 0) -> tuple:
+    """لیست سفارش‌های باز (پیش‌فاکتورهای صادرشده) با امکان انتخاب جهت اصلاح، حذف، تبدیل به فاکتور یا زدن دکمه پرداخت گردید"""
+    open_list = get_orders_by_acc_status("open")
+    page_size = 8
+    total_pages = max(1, (len(open_list) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start_i = page * page_size
+    end_i = min(len(open_list), start_i + page_size)
+
+    if not open_list:
+        txt = (
+            "📂 **لیست سفارش‌های باز (پیش‌فاکتورها):**\n\n"
+            "✅ در حال حاضر هیچ سفارش بازی وجود ندارد.\n"
+            "_(به محض صدور هر پیش‌فاکتور جدید توسط مشتری یا شما، خودکار به این بخش اضافه می‌شود)_"
+        )
+    else:
+        total_cust = 0
+        total_fact = 0
+        total_prof = 0
+        lines = [
+            f"📂 **سفارش‌های باز ({to_fa_num(len(open_list))} سفارش) — صفحه {to_fa_num(page + 1)} از {to_fa_num(total_pages)}:**\n"
+        ]
+        for rec in open_list[start_i:end_i]:
+            oid = rec["order_id"]
+            od = rec["order_data"]
+            fin = calculate_order_financials(od["items"], order_data=od)
+            doc_t = od.get("doc_type", "پیش‌فاکتور")
+            cust = od.get("customer_title", "مشتری")
+            dt = to_fa_num(od.get("date", ""))
+            lines.append(
+                f"🔹 **کد `#{to_fa_num(oid)}`** | {cust} ({doc_t} - {dt})\n"
+                f"   📦 تعداد: `{to_fa_num(fin['total_qty'])} دست` | 💰 مشتری: `{to_fa_num(fin['total_payable'], comma=True)} ریال`\n"
+                f"   🏭 تسویه کارخانه (۲۰٪ تخفیف): `{to_fa_num(fin['factory_payable_total'], comma=True)}` | 💎 سود: `{to_fa_num(fin['net_profit'], comma=True)} ریال`"
+            )
+        for rec in open_list:
+            fin = calculate_order_financials(rec["order_data"]["items"], order_data=rec["order_data"])
+            total_cust += fin["total_payable"]
+            total_fact += fin["factory_payable_total"]
+            total_prof += fin["net_profit"]
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"💰 **جمع کل سفارش‌های باز:** `{to_fa_num(total_cust, comma=True)} ریال`")
+        lines.append(f"🏭 **جمع سهم کارخانه (با ۲۰٪ تخفیف):** `{to_fa_num(total_fact, comma=True)} ریال`")
+        lines.append(f"💎 **جمع سود پیش‌بینی‌شده:** `{to_fa_num(total_prof, comma=True)} ریال`")
+        lines.append("\n👇 **روی سفارش مورد نظر کلیک کنید تا آن را اصلاح، حذف، تبدیل به فاکتور یا «پرداخت گردید» نمایید:**")
+        txt = "\n".join(lines)
+
+    rows = []
+    for rec in open_list[start_i:end_i]:
+        oid = rec["order_id"]
+        od = rec["order_data"]
+        fin = calculate_order_financials(od["items"], order_data=od)
+        doc_badge = "🧾 فاکتور" if od.get("doc_type") == "فاکتور" else "📄 پیش‌فاکتور"
+        btn_lbl = f"#{to_fa_num(oid)} | {od.get('customer_title', 'مشتری')} | {doc_badge} ({to_fa_num(fin['total_qty'])} دست)"
+        rows.append([InlineKeyboardButton(btn_lbl, callback_data=f"acc_view_open:{oid}")])
+
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"acc_menu_open:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"صفحه {to_fa_num(page + 1)}/{to_fa_num(total_pages)}", callback_data="noop_page"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"acc_menu_open:{page + 1}"))
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton("🔙 بازگشت به داشبورد حسابداری", callback_data="acc_dashboard")])
+    return txt, InlineKeyboardMarkup(rows)
+
+
+def build_single_open_order_text_and_kb(oid: str) -> tuple:
+    """نمایش جزئیات کامل یک سفارش باز همراه با دکمه‌های اصلاح، حذف، تبدیل به فاکتور و پرداخت گردید"""
+    rec = ACCOUNTING_ORDERS.get(str(oid))
+    if not rec:
+        return "⚠️ این سفارش یافت نشد.", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="acc_menu_open:0")]])
+
+    od = rec["order_data"]
+    items = od.get("items", [])
+    fin = calculate_order_financials(items, order_data=od)
+    carton_stats = calculate_order_cartons(items)
+    doc_t = od.get("doc_type", "پیش‌فاکتور")
+    mode_lbl = "سفارش خرد" if od.get("order_mode") == "retail" else "سفارش عمده"
+    cust = od.get("customer_title", "مشتری گرامی")
+
+    item_lines = []
+    for i, it in enumerate(items[:20], start=1):
+        f_list, f_pay = get_item_factory_prices(it)
+        shim_s = "با شیم" if it.get("with_shim") else "بدون شیم"
+        item_lines.append(
+            f"{to_fa_num(i)}. **{it['base_name']}** ({shim_s}) — `{to_fa_num(it['qty'])} دست`\n"
+            f"   🔸 فی مشتری: `{to_fa_num(it['unit_price'], comma=True)}` | فی تسویه کارخانه (۲۰٪-): `{to_fa_num(f_pay, comma=True)} ریال`"
+        )
+    if len(items) > 20:
+        item_lines.append(f"... و {to_fa_num(len(items) - 20)} ردیف دیگر")
+
+    disc_line = ""
+    if fin["discount_amount"] > 0:
+        disc_line = (
+            f"💵 جمع قبل از تخفیف مشتری: `{to_fa_num(fin['subtotal'], comma=True)} ریال`\n"
+            f"🎁 {fin['discount_label']}: `-{to_fa_num(fin['discount_amount'], comma=True)} ریال`\n"
+        )
+
+    txt = (
+        f"📂 **مدیریت سفارش باز `#{to_fa_num(oid)}`**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 **نام مشتری:** `{cust}`\n"
+        f"📄 **نوع سند فعلی:** `{doc_t}` | 🏷 **حالت:** `{mode_lbl}`\n"
+        f"📅 **تاریخ ثبت:** `{to_fa_num(od.get('date', ''))}`\n"
+        f"📦 **تعداد کل:** `{to_fa_num(fin['total_qty'])} دست` (`{carton_stats['summary_full']}`)\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "📋 **اقلام سفارش:**\n"
+        + "\n".join(item_lines)
+        + "\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"{disc_line}"
+        f"💰 **مبلغ قابل پرداخت مشتری به شما:** `{to_fa_num(fin['total_payable'], comma=True)} ریال`\n"
+        f"🏭 **مبلغ به لیست قیمت کارخانه:** `{to_fa_num(fin['factory_list_total'], comma=True)} ریال`\n"
+        f"🎁 **۲۰٪ تخفیف کارخانه برای شما:** `{to_fa_num(fin['factory_discount_amount'], comma=True)} ریال`\n"
+        f"💳 **سهم قابل پرداخت شما به کارخانه:** `{to_fa_num(fin['factory_payable_total'], comma=True)} ریال`\n"
+        f"💎 **سود خالص شما از این سفارش:** `{to_fa_num(fin['net_profit'], comma=True)} ریال` (`{to_fa_num(fin['net_profit'] // 10, comma=True)} تومان`)\n\n"
+        "👇 عملیات مورد نظر روی این سفارش باز را انتخاب کنید:"
+    )
+
+    curr_mode = od.get("order_mode", "wholesale")
+    switch_mode_btn = (
+        InlineKeyboardButton("📦 محاسبه با قیمت عمده", callback_data=f"acc_switch_mode:{oid}:wholesale")
+        if curr_mode == "retail"
+        else InlineKeyboardButton("🛍 محاسبه با قیمت خرد", callback_data=f"acc_switch_mode:{oid}:retail")
+    )
+
+    kb_rows = [
+        [
+            InlineKeyboardButton(
+                "✅ پرداخت گردید (انتقال به سفارشات تسویه‌نشده)",
+                callback_data=f"acc_mark_paid:{oid}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📄 تبدیل به فاکتور و دریافت PDF",
+                callback_data=f"acc_to_invoice:{oid}",
+            ),
+            InlineKeyboardButton(
+                "📥 دریافت PDF فعلی",
+                callback_data=f"acc_dl_pdf:{oid}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "✏️ اصلاح اقلام این سفارش",
+                callback_data=f"acc_edit_open:{oid}",
+            ),
+            switch_mode_btn,
+        ],
+        [
+            InlineKeyboardButton(
+                "🎁 تخفیف درصدی",
+                callback_data=f"adm_disc_pct:{oid}",
+            ),
+            InlineKeyboardButton(
+                "💵 تخفیف مبلغی",
+                callback_data=f"adm_disc_amt:{oid}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🗑 حذف این سفارش باز",
+                callback_data=f"acc_del_open:{oid}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔙 بازگشت به لیست سفارش‌های باز",
+                callback_data="acc_menu_open:0",
+            )
+        ],
+    ]
+    return txt, InlineKeyboardMarkup(kb_rows)
+
+
+def build_unsettled_orders_text_and_kb(page: int = 0) -> tuple:
+    """
+    لیست سفارشات تسویه‌نشده (مشتری پول را به مدیر پرداخت کرده اما مدیر هنوز با کارخانه تسویه نکرده است)
+    با قابلیت انتخاب تکی/چندتایی یا همه سفارشات و صدور فاکتور تجمیعی کارخانه با ۲۰٪ تخفیف
+    """
+    unsettled_list = get_orders_by_acc_status("paid_unsettled")
+    valid_oids = {rec["order_id"] for rec in unsettled_list}
+    # پاکسازی انتخاب‌های قدیمی که دیگر در لیست تسویه‌نشده نیستند
+    ADMIN_SELECTED_SETTLE_OIDS.intersection_update(valid_oids)
+
+    page_size = 8
+    total_pages = max(1, (len(unsettled_list) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start_i = page * page_size
+    end_i = min(len(unsettled_list), start_i + page_size)
+
+    if not unsettled_list:
+        txt = (
+            "💳 **سفارشات تسویه‌نشده با کارخانه (پرداخت‌شده توسط مشتری):**\n\n"
+            "✅ در حال حاضر هیچ سفارش تسویه‌نشده‌ای با کارخانه وجود ندارد.\n"
+            "_(وقتی در بخش سفارش‌های باز دکمه «✅ پرداخت گردید» را بزنید، سفارش به این لیست منتقل می‌شود)_"
+        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به داشبورد حسابداری", callback_data="acc_dashboard")]])
+        return txt, kb
+
+    all_cust_total = 0
+    all_fact_list = 0
+    all_fact_payable = 0
+    all_profit = 0
+
+    sel_cust_total = 0
+    sel_fact_list = 0
+    sel_fact_payable = 0
+    sel_profit = 0
+    sel_count = 0
+
+    lines = [
+        f"💳 **سفارشات تسویه‌نشده با کارخانه ({to_fa_num(len(unsettled_list))} سفارش) — صفحه {to_fa_num(page + 1)} از {to_fa_num(total_pages)}:**\n"
+    ]
+
+    for rec in unsettled_list:
+        oid = rec["order_id"]
+        od = rec["order_data"]
+        fin = calculate_order_financials(od["items"], order_data=od)
+        all_cust_total += fin["total_payable"]
+        all_fact_list += fin["factory_list_total"]
+        all_fact_payable += fin["factory_payable_total"]
+        all_profit += fin["net_profit"]
+        if oid in ADMIN_SELECTED_SETTLE_OIDS:
+            sel_count += 1
+            sel_cust_total += fin["total_payable"]
+            sel_fact_list += fin["factory_list_total"]
+            sel_fact_payable += fin["factory_payable_total"]
+            sel_profit += fin["net_profit"]
+
+    for rec in unsettled_list[start_i:end_i]:
+        oid = rec["order_id"]
+        od = rec["order_data"]
+        fin = calculate_order_financials(od["items"], order_data=od)
+        chk = "☑️" if oid in ADMIN_SELECTED_SETTLE_OIDS else "⬜️"
+        cust = od.get("customer_title", "مشتری")
+        paid_dt = to_fa_num(rec.get("paid_at") or od.get("date", ""))
+        lines.append(
+            f"{chk} **سفارش `#{to_fa_num(oid)}`** | {cust} ({paid_dt})\n"
+            f"   📦 تعداد: `{to_fa_num(fin['total_qty'])} دست` | 💰 دریافتی از مشتری: `{to_fa_num(fin['total_payable'], comma=True)} ریال`\n"
+            f"   🏭 لیست کارخانه: `{to_fa_num(fin['factory_list_total'], comma=True)}` | 💳 **سهم کارخانه (۲۰٪-): `{to_fa_num(fin['factory_payable_total'], comma=True)} ریال`**\n"
+            f"   💎 **سود خالص شما:** `{to_fa_num(fin['net_profit'], comma=True)} ریال`"
+        )
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"📊 **جمع کل همه تسویه‌نشده‌ها ({to_fa_num(len(unsettled_list))} سفارش):**")
+    lines.append(f"• مجموع دریافتی از مشتریان: `{to_fa_num(all_cust_total, comma=True)} ریال`")
+    lines.append(f"• **مجموع قابل پرداخت به کارخانه (با ۲۰٪ تخفیف):** `{to_fa_num(all_fact_payable, comma=True)} ریال` (`{to_fa_num(all_fact_payable // 10, comma=True)} تومان`)")
+    lines.append(f"• **مجموع سود خالص شما:** `{to_fa_num(all_profit, comma=True)} ریال` (`{to_fa_num(all_profit // 10, comma=True)} تومان`)")
+
+    if sel_count > 0:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"✅ **جمع سفارش‌های انتخاب‌شده فعلی ({to_fa_num(sel_count)} سفارش):**")
+        lines.append(f"• لیست کارخانه: `{to_fa_num(sel_fact_list, comma=True)} ریال`")
+        lines.append(f"• **مبلغ تسویه با کارخانه (با ۲۰٪ تخفیف):** `{to_fa_num(sel_fact_payable, comma=True)} ریال` (`{to_fa_num(sel_fact_payable // 10, comma=True)} تومان`)")
+        lines.append(f"• **سود خالص انتخاب‌شده‌ها:** `{to_fa_num(sel_profit, comma=True)} ریال`")
+
+    lines.append("\n👇 با زدن روی هر سفارش آن را انتخاب/لغو انتخاب کنید و سپس دکمه تسویه و صدور فاکتور کارخانه را بزنید:")
+    txt = "\n".join(lines)
+
+    rows = []
+    for rec in unsettled_list[start_i:end_i]:
+        oid = rec["order_id"]
+        od = rec["order_data"]
+        fin = calculate_order_financials(od["items"], order_data=od)
+        chk = "☑️" if oid in ADMIN_SELECTED_SETTLE_OIDS else "⬜️"
+        btn_lbl = f"{chk} #{to_fa_num(oid)} {od.get('customer_title', 'مشتری')} | کارخانه: {to_fa_num(fin['factory_payable_total'], comma=True)}"
+        rows.append(
+            [
+                InlineKeyboardButton(btn_lbl, callback_data=f"acc_toggle_sel:{oid}:{page}"),
+                InlineKeyboardButton("👁 جزئیات", callback_data=f"acc_view_unsettled:{oid}"),
+            ]
+        )
+
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"acc_menu_unsettled:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"صفحه {to_fa_num(page + 1)}/{to_fa_num(total_pages)}", callback_data="noop_page"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"acc_menu_unsettled:{page + 1}"))
+        rows.append(nav)
+
+    rows.append(
+        [
+            InlineKeyboardButton("☑️ انتخاب همه", callback_data=f"acc_sel_all:{page}"),
+            InlineKeyboardButton("⬜️ لغو انتخاب همه", callback_data=f"acc_unsel_all:{page}"),
+        ]
+    )
+    if sel_count > 0:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"🧾 صدور فاکتور کارخانه (۲۰٪ تخفیف) و تسویه {to_fa_num(sel_count)} سفارش انتخابی",
+                    callback_data="acc_settle_selected",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                f"🧾 تسویه یکجای همه ({to_fa_num(len(unsettled_list))} سفارش) و صدور فاکتور کارخانه",
+                callback_data="acc_settle_all",
+            )
+        ]
+    )
+    rows.append([InlineKeyboardButton("🔙 بازگشت به داشبورد حسابداری", callback_data="acc_dashboard")])
+    return txt, InlineKeyboardMarkup(rows)
+
+
+def build_archived_orders_text_and_kb(page: int = 0) -> tuple:
+    """نمایش بایگانی سفارشات تسویه‌شده با کارخانه"""
+    archived_list = get_orders_by_acc_status("settled_archived")
+    page_size = 8
+    total_pages = max(1, (len(archived_list) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start_i = page * page_size
+    end_i = min(len(archived_list), start_i + page_size)
+
+    if not archived_list:
+        txt = (
+            "🗄 **بایگانی سفارشات تسویه‌شده با کارخانه:**\n\n"
+            "هنوز سفارشی در بایگانی ثبت نشده است."
+        )
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به داشبورد حسابداری", callback_data="acc_dashboard")]])
+        return txt, kb
+
+    total_cust = 0
+    total_fact = 0
+    total_prof = 0
+    for rec in archived_list:
+        fin = calculate_order_financials(rec["order_data"]["items"], order_data=rec["order_data"])
+        total_cust += fin["total_payable"]
+        total_fact += fin["factory_payable_total"]
+        total_prof += fin["net_profit"]
+
+    lines = [
+        f"🗄 **بایگانی سفارشات تسویه‌شده ({to_fa_num(len(archived_list))} سفارش) — صفحه {to_fa_num(page + 1)} از {to_fa_num(total_pages)}:**\n"
+    ]
+    for rec in archived_list[start_i:end_i]:
+        oid = rec["order_id"]
+        od = rec["order_data"]
+        fin = calculate_order_financials(od["items"], order_data=od)
+        cust = od.get("customer_title", "مشتری")
+        s_dt = to_fa_num(rec.get("settled_at") or od.get("date", ""))
+        b_id = rec.get("settlement_batch_id", "")
+        batch_str = f" | کد تسویه: `#{to_fa_num(b_id)}`" if b_id else ""
+        lines.append(
+            f"✅ **کد `#{to_fa_num(oid)}`** | {cust} (تسویه: {s_dt}{batch_str})\n"
+            f"   📦 `{to_fa_num(fin['total_qty'])} دست` | 💰 مشتری: `{to_fa_num(fin['total_payable'], comma=True)}` | 🏭 کارخانه: `{to_fa_num(fin['factory_payable_total'], comma=True)}` | 💎 سود: `{to_fa_num(fin['net_profit'], comma=True)} ریال`"
+        )
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"💰 **جمع کل فروش بایگانی:** `{to_fa_num(total_cust, comma=True)} ریال`")
+    lines.append(f"🏭 **جمع تسویه‌شده با کارخانه (۲۰٪-):** `{to_fa_num(total_fact, comma=True)} ریال`")
+    lines.append(f"💎 **جمع سود خالص قطعی در بایگانی:** `{to_fa_num(total_prof, comma=True)} ریال` (`{to_fa_num(total_prof // 10, comma=True)} تومان`)")
+    txt = "\n".join(lines)
+
+    rows = []
+    for rec in archived_list[start_i:end_i]:
+        oid = rec["order_id"]
+        od = rec["order_data"]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"📥 دریافت PDF سفارش #{to_fa_num(oid)} ({od.get('customer_title', 'مشتری')})",
+                    callback_data=f"acc_dl_pdf:{oid}",
+                ),
+                InlineKeyboardButton(
+                    "↩️ بازگردانی به تسویه‌نشده",
+                    callback_data=f"acc_unarchive:{oid}",
+                ),
+            ]
+        )
+
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"acc_menu_archived:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"صفحه {to_fa_num(page + 1)}/{to_fa_num(total_pages)}", callback_data="noop_page"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"acc_menu_archived:{page + 1}"))
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton("🔙 بازگشت به داشبورد حسابداری", callback_data="acc_dashboard")])
+    return txt, InlineKeyboardMarkup(rows)
+
+
+def build_monthly_stats_text_and_kb(month_key: str = "current") -> tuple:
+    """
+    بخش آمار و گزارش سود ماهانه (تعداد سفارشات ماه، مجموع فروش، سهم کارخانه با ۲۰٪ تخفیف، سود خالص ماهانه و امکان مشاهده ماه‌های قبل)
+    """
+    curr_ym = extract_jalali_year_month(get_today_jalali())
+    if not month_key or month_key == "current":
+        target_ym = curr_ym
+    else:
+        target_ym = month_key
+
+    # گردآوری تمام ماه‌های موجود در دیتابیس
+    available_months = {curr_ym}
+    filtered_records = []
+
+    for rec in ACCOUNTING_ORDERS.values():
+        od = rec.get("order_data", {})
+        if not od.get("items"):
+            continue
+        ym = extract_jalali_year_month(od.get("date") or rec.get("created_at"))
+        available_months.add(ym)
+        if target_ym == "all" or ym == target_ym:
+            filtered_records.append(rec)
+
+    n_open = 0
+    n_unsettled = 0
+    n_archived = 0
+
+    confirmed_sets = 0
+    confirmed_items_all = []
+    confirmed_cust_revenue = 0
+    confirmed_fact_list = 0
+    confirmed_fact_discount = 0
+    confirmed_fact_payable = 0
+    confirmed_settled_fact = 0
+    confirmed_unsettled_fact = 0
+    confirmed_net_profit = 0
+
+    open_sets = 0
+    open_cust_revenue = 0
+    open_fact_payable = 0
+    open_net_profit = 0
+
+    for rec in filtered_records:
+        st = rec.get("acc_status", "open")
+        od = rec["order_data"]
+        fin = calculate_order_financials(od["items"], order_data=od)
+        if st == "open":
+            n_open += 1
+            open_sets += fin["total_qty"]
+            open_cust_revenue += fin["total_payable"]
+            open_fact_payable += fin["factory_payable_total"]
+            open_net_profit += fin["net_profit"]
+        else:
+            if st == "paid_unsettled":
+                n_unsettled += 1
+                confirmed_unsettled_fact += fin["factory_payable_total"]
+            else:
+                n_archived += 1
+                confirmed_settled_fact += fin["factory_payable_total"]
+            confirmed_sets += fin["total_qty"]
+            confirmed_items_all.extend(od["items"])
+            confirmed_cust_revenue += fin["total_payable"]
+            confirmed_fact_list += fin["factory_list_total"]
+            confirmed_fact_discount += fin["factory_discount_amount"]
+            confirmed_fact_payable += fin["factory_payable_total"]
+            confirmed_net_profit += fin["net_profit"]
+
+    total_orders = n_open + n_unsettled + n_archived
+    n_confirmed = n_unsettled + n_archived
+    carton_stats = calculate_order_cartons(confirmed_items_all) if confirmed_items_all else {"summary_short": "۰ کارتن"}
+    margin_pct = round((confirmed_net_profit / confirmed_cust_revenue) * 100.0, 1) if confirmed_cust_revenue > 0 else 0.0
+
+    period_title = format_jalali_month_title(target_ym)
+    txt = (
+        f"📊 **گزارش جامع آمار و سود — {period_title}**\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔢 **تعداد کل سفارشات ثبت‌شده:** `{to_fa_num(total_orders)} سفارش`\n"
+        f"   • ✅ سفارشات قطعی (پرداخت‌شده و تسویه‌شده): `{to_fa_num(n_confirmed)} سفارش`\n"
+        f"     _(شامل `{to_fa_num(n_unsettled)}` تسویه‌نشده با کارخانه و `{to_fa_num(n_archived)}` تسویه‌شده در بایگانی)_\n"
+        f"   • 📂 سفارش‌های باز (پیش‌فاکتورهای جاری): `{to_fa_num(n_open)} سفارش`\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 **عملکرد مالی سفارشات قطعی ({to_fa_num(n_confirmed)} سفارش پرداخت‌شده):**\n"
+        f"📦 **تعداد لنت فروخته‌شده:** `{to_fa_num(confirmed_sets)} دست` (`{carton_stats['summary_short']}`)\n"
+        f"💵 **مجموع کل فروش (دریافتی از مشتریان):**\n"
+        f"   `{to_fa_num(confirmed_cust_revenue, comma=True)} ریال` (`{to_fa_num(confirmed_cust_revenue // 10, comma=True)} تومان`)\n"
+        f"🏭 **مجموع به قیمت لیست کارخانه:** `{to_fa_num(confirmed_fact_list, comma=True)} ریال`\n"
+        f"🎁 **مجموع ۲۰٪ تخفیف شما از کارخانه:** `{to_fa_num(confirmed_fact_discount, comma=True)} ریال`\n"
+        f"💳 **مجموع سهم قابل پرداخت به کارخانه (با ۲۰٪ تخفیف):**\n"
+        f"   `{to_fa_num(confirmed_fact_payable, comma=True)} ریال` (`{to_fa_num(confirmed_fact_payable // 10, comma=True)} تومان`)\n"
+        f"   ├ پرداخت‌شده به کارخانه: `{to_fa_num(confirmed_settled_fact, comma=True)} ریال`\n"
+        f"   └ بدهی باز به کارخانه: `{to_fa_num(confirmed_unsettled_fact, comma=True)} ریال`\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 **سود خالص قطعی شما در این دوره (حاشیه سود `{format_float_fa(margin_pct)}٪`):**\n"
+        f"🌟 **`{to_fa_num(confirmed_net_profit, comma=True)} ریال`**\n"
+        f"🌟 _(معادل **`{to_fa_num(confirmed_net_profit // 10, comma=True)} تومان`**)_\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 **وضعیت سفارش‌های باز این دوره ({to_fa_num(n_open)} پیش‌فاکتور = {to_fa_num(open_sets)} دست):**\n"
+        f"• مبلغ پیش‌فاکتورهای باز: `{to_fa_num(open_cust_revenue, comma=True)} ریال`\n"
+        f"• سود پیش‌بینی‌شده سفارش‌های باز: `{to_fa_num(open_net_profit, comma=True)} ریال`\n"
+        f"• **مجموع سود کل (قطعی + باز):** `{to_fa_num(confirmed_net_profit + open_net_profit, comma=True)} ریال`"
+    )
+
+    rows = []
+    base_nav_ym = curr_ym if target_ym == "all" else target_ym
+    prev_ym = shift_jalali_year_month(base_nav_ym, -1)
+    next_ym = shift_jalali_year_month(base_nav_ym, +1)
+    rows.append(
+        [
+            InlineKeyboardButton(f"⬅️ ماه قبل ({to_fa_num(prev_ym)})", callback_data=f"acc_menu_stats:{prev_ym}"),
+            InlineKeyboardButton(f"ماه بعد ({to_fa_num(next_ym)}) ➡️", callback_data=f"acc_menu_stats:{next_ym}"),
+        ]
+    )
+
+    # دکمه‌های دسترسی سریع به ماه‌های اخیر و ماه‌های دارای سفارش
+    for i in range(1, 6):
+        available_months.add(shift_jalali_year_month(curr_ym, -i))
+    sorted_months = sorted(available_months, reverse=True)[:6]
+    m_btns = []
+    for ym in sorted_months:
+        mark = "✅ " if ym == target_ym else ""
+        try:
+            p = ym.split("/")
+            lbl = f"{mark}{JALALI_MONTH_NAMES.get(int(p[1]), p[1])} {to_fa_num(p[0])}"
+        except Exception:
+            lbl = f"{mark}{to_fa_num(ym)}"
+        m_btns.append(InlineKeyboardButton(lbl, callback_data=f"acc_menu_stats:{ym}"))
+        if len(m_btns) == 2:
+            rows.append(m_btns)
+            m_btns = []
+    if m_btns:
+        rows.append(m_btns)
+
+    all_mark = "✅ " if target_ym == "all" else ""
+    rows.append(
+        [
+            InlineKeyboardButton(f"{all_mark}📊 نمایش آمار تجمیعی کل ماه‌ها", callback_data="acc_menu_stats:all"),
+            InlineKeyboardButton("📅 ماه جاری", callback_data="acc_menu_stats:current"),
+        ]
+    )
+    rows.append([InlineKeyboardButton("🔙 بازگشت به داشبورد حسابداری", callback_data="acc_dashboard")])
+    return txt, InlineKeyboardMarkup(rows)
+
+
+async def accounting_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دستور /accounting ویژه مدیر جهت باز کردن پنل حسابداری"""
+    user_id = update.effective_user.id if update.effective_user else 0
+    if user_id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔ بخش حسابداری منحصراً در اختیار مدیر سیستم است.")
+        return
+    txt, kb = build_accounting_dashboard_text_and_kb()
+    await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+
+
 async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global RUNTIME_PAYMENT_BANK_INFO
     user_text = update.message.text.strip()
@@ -3456,6 +4517,7 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order_data["discount_type"] = d_type
             order_data["discount_value"] = d_val
             order_data["doc_type"] = "پیش‌فاکتور"
+            register_or_update_accounting_order(oid, order_data, ord_rec.get("customer_chat_id", chat_id))
 
             wait_disc = await update.message.reply_text("⏳ در حال اعمال تخفیف و بروزرسانی فایل پیش‌فاکتور...")
             try:
@@ -3539,6 +4601,11 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order_data = ord_rec["order_data"]
             order_data["doc_type"] = "فاکتور"
             ord_rec["status"] = "completed"
+            if ord_rec.get("acc_status", "open") == "open":
+                ord_rec["acc_status"] = "paid_unsettled"
+                ord_rec["paid_at"] = get_today_jalali()
+            ACCOUNTING_ORDERS[str(oid)] = ord_rec
+            save_accounting_db()
             USER_ACTIVE_ORDER_ID.pop(cust_chat_id, None)
 
             wait_adm = await update.message.reply_text("⏳ در حال صدور و ارسال فاکتور نهایی برای مشتری...")
@@ -3579,6 +4646,17 @@ async def handle_text_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.exception("Error sending final invoice to customer")
                 await wait_adm.edit_text(f"❌ خطا در ارسال فاکتور نهایی به مشتری: `{e}`", parse_mode="Markdown")
             return
+
+    # ۰.۵ بررسی کلیک روی دکمه «💼 بخش حسابداری (ویژه مدیر)»
+    if user_text in (BTN_ACCOUNTING_TEXT, "حسابداری", "بخش حسابداری", "پنل حسابداری"):
+        if user_id != ADMIN_TELEGRAM_ID:
+            await update.message.reply_text("⛔ بخش حسابداری منحصراً در اختیار مدیر سیستم است.")
+            return
+        USER_EDIT_STATE.pop(chat_id, None)
+        AWAITING_QUESTION_MODE.discard(chat_id)
+        txt, kb = build_accounting_dashboard_text_and_kb()
+        await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+        return
 
     # ۱. بررسی کلیک روی دکمه «🔐 وارد کردن رمز» یا ارسال رمز ۵ رقمی در حالت انتظار
     if user_text in (BTN_VIP_CODE_TEXT, "🔓 حالت ویژه فعال است", "رمز", "وارد کردن رمز"):
@@ -3992,11 +5070,441 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else chat_id
     vip_flag = is_user_vip(user_id)
     data = query.data or ""
-    if not data.startswith(("cust_submit_proforma:", "adm_", "item_del:", "item_shim:", "toggle_")):
+    if not data.startswith(("cust_submit_proforma:", "adm_", "acc_", "item_del:", "item_shim:", "toggle_")):
         try:
             await query.answer()
         except Exception:
             pass
+
+
+    # ۰. هندلرهای بخش حسابداری انحصاری مدیر (acc_*)
+    if data == "acc_dashboard" or data.startswith("acc_"):
+        if user_id != ADMIN_TELEGRAM_ID:
+            await query.answer("⛔ بخش حسابداری فقط مخصوص مدیر سیستم است.", show_alert=True)
+            return
+
+        if data == "acc_dashboard":
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            txt, kb = build_accounting_dashboard_text_and_kb()
+            if query.message.document or query.message.photo:
+                await query.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+            else:
+                await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            return
+
+        if data == "acc_sync_gsheet":
+            await query.answer("⏳ در حال ارتباط با گوگل‌شیت کارخانه...")
+            ok, msg = sync_catalog_from_factory_gsheet()
+            txt, kb = build_accounting_dashboard_text_and_kb()
+            prefix = f"✅ {msg}" if ok else f"⚠️ {msg}"
+            if query.message.document or query.message.photo:
+                await query.message.reply_text(f"{prefix}\n\n{txt}", parse_mode="Markdown", reply_markup=kb)
+            else:
+                await query.edit_message_text(f"{prefix}\n\n{txt}", parse_mode="Markdown", reply_markup=kb)
+            return
+
+        if data.startswith("acc_menu_open:"):
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            page = int(data.split(":")[1])
+            txt, kb = build_open_orders_list_text_and_kb(page=page)
+            if query.message.document or query.message.photo:
+                await query.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+            else:
+                await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            return
+
+        if data.startswith("acc_view_open:"):
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            oid = data.split(":")[1]
+            txt, kb = build_single_open_order_text_and_kb(oid)
+            if query.message.document or query.message.photo:
+                await query.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+            else:
+                await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            return
+
+        if data.startswith("acc_switch_mode:"):
+            _, oid, target_mode = data.split(":")
+            rec = ACCOUNTING_ORDERS.get(str(oid))
+            if not rec:
+                await query.answer("⚠️ سفارش یافت نشد.", show_alert=True)
+                return
+            od = rec["order_data"]
+            od["order_mode"] = target_mode
+            od["force_wholesale"] = (target_mode == "wholesale")
+            od["admin_modified_pricing"] = True
+            apply_order_mode_pricing_to_items(od["items"], order_mode=target_mode)
+            save_accounting_db()
+            mode_fa = "سفارش عمده" if target_mode == "wholesale" else "سفارش خرد"
+            await query.answer(f"✅ قیمت سفارش #{to_fa_num(oid)} به «{mode_fa}» تغییر یافت.")
+            txt, kb = build_single_open_order_text_and_kb(oid)
+            if query.message.document or query.message.photo:
+                await query.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+            else:
+                await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            return
+
+        if data.startswith("acc_edit_open:"):
+            import copy
+            oid = data.split(":")[1]
+            rec = ACCOUNTING_ORDERS.get(str(oid))
+            if not rec:
+                await query.answer("⚠️ سفارش یافت نشد.", show_alert=True)
+                return
+            await query.answer("✏️ ورود به منوی اصلاح اقلام سفارش باز")
+            draft = copy.deepcopy(rec["order_data"])
+            draft["editing_accounting_oid"] = str(oid)
+            draft["name_confirmed"] = True
+            PENDING_DRAFT_ORDERS[chat_id] = draft
+            summary_txt = (
+                f"✏️ **اصلاح سفارش باز `#{to_fa_num(oid)}`:**\n\n"
+                + format_draft_order_summary(draft, is_vip=True)
+                + "\n\n👇 روی هر لنت کلیک کنید تا تعداد، شیم یا ضخامت آن را تغییر دهید و در پایان **«✅ تایید نهایی»** را بزنید:"
+            )
+            kb_edit = get_draft_edit_list_keyboard(draft, is_vip=True)
+            if query.message.document or query.message.photo:
+                await query.message.reply_text(summary_txt, parse_mode="Markdown", reply_markup=kb_edit)
+            else:
+                await query.edit_message_text(summary_txt, parse_mode="Markdown", reply_markup=kb_edit)
+            return
+
+        if data.startswith("acc_to_invoice:"):
+            oid = data.split(":")[1]
+            rec = ACCOUNTING_ORDERS.get(str(oid))
+            if not rec:
+                await query.answer("⚠️ سفارش یافت نشد.", show_alert=True)
+                return
+            od = rec["order_data"]
+            od["doc_type"] = "فاکتور"
+            save_accounting_db()
+            await query.answer("✅ به «فاکتور» تبدیل شد. در حال ارسال PDF...")
+            pdf_bytes = generate_pdf_bytes(od)
+            cust = od.get("customer_title", "مشتری")
+            fin = calculate_order_financials(od["items"], order_data=od)
+            kb_inv = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ پرداخت گردید (انتقال به تسویه‌نشده‌ها)",
+                            callback_data=f"acc_mark_paid:{oid}",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            f"📂 بازگشت به مدیریت سفارش #{to_fa_num(oid)}",
+                            callback_data=f"acc_view_open:{oid}",
+                        )
+                    ],
+                ]
+            )
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=io.BytesIO(pdf_bytes),
+                filename=f"فاکتور سفارش {cust} - کد {oid}.pdf",
+                caption=(
+                    f"🧾 **فاکتور رسمی سفارش `#{to_fa_num(oid)}` ({cust})**\n"
+                    f"💰 مبلغ مشتری: `{to_fa_num(fin['total_payable'], comma=True)} ریال`\n"
+                    f"💳 سهم کارخانه (با ۲۰٪ تخفیف): `{to_fa_num(fin['factory_payable_total'], comma=True)} ریال`\n"
+                    f"💎 سود خالص شما: `{to_fa_num(fin['net_profit'], comma=True)} ریال`"
+                ),
+                parse_mode="Markdown",
+                reply_markup=kb_inv,
+            )
+            return
+
+        if data.startswith("acc_dl_pdf:"):
+            oid = data.split(":")[1]
+            rec = ACCOUNTING_ORDERS.get(str(oid))
+            if not rec:
+                await query.answer("⚠️ سفارش یافت نشد.", show_alert=True)
+                return
+            od = rec["order_data"]
+            doc_t = od.get("doc_type", "پیش‌فاکتور")
+            cust = od.get("customer_title", "مشتری")
+            await query.answer(f"📥 در حال ارسال فایل {doc_t}...")
+            pdf_bytes = generate_pdf_bytes(od)
+            fin = calculate_order_financials(od["items"], order_data=od)
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=io.BytesIO(pdf_bytes),
+                filename=f"{doc_t} سفارش {cust} - کد {oid}.pdf",
+                caption=(
+                    f"📄 **{doc_t} سفارش `#{to_fa_num(oid)}` ({cust})**\n"
+                    f"💰 مبلغ مشتری: `{to_fa_num(fin['total_payable'], comma=True)} ریال`\n"
+                    f"💳 سهم کارخانه (۲۰٪-): `{to_fa_num(fin['factory_payable_total'], comma=True)} ریال`\n"
+                    f"💎 سود خالص شما: `{to_fa_num(fin['net_profit'], comma=True)} ریال`"
+                ),
+                parse_mode="Markdown",
+            )
+            return
+
+        if data.startswith("acc_mark_paid:"):
+            oid = data.split(":")[1]
+            rec = ACCOUNTING_ORDERS.get(str(oid))
+            if not rec:
+                await query.answer("⚠️ سفارش یافت نشد.", show_alert=True)
+                return
+            rec["acc_status"] = "paid_unsettled"
+            rec["paid_at"] = get_today_jalali()
+            rec["order_data"]["doc_type"] = "فاکتور"
+            ADMIN_SELECTED_SETTLE_OIDS.add(str(oid))
+            save_accounting_db()
+            fin = calculate_order_financials(rec["order_data"]["items"], order_data=rec["order_data"])
+            await query.answer("✅ سفارش به عنوان «پرداخت گردید» ثبت شد و به سفارشات تسویه‌نشده منتقل گردید!", show_alert=True)
+            msg_paid = (
+                f"✅ **سفارش `#{to_fa_num(oid)}` ({rec['order_data'].get('customer_title', '')}) پرداخت گردید!**\n\n"
+                f"💰 مبلغ دریافتی از مشتری: `{to_fa_num(fin['total_payable'], comma=True)} ریال`\n"
+                f"💳 **سهم قابل پرداخت شما به کارخانه (با ۲۰٪ تخفیف):** `{to_fa_num(fin['factory_payable_total'], comma=True)} ریال`\n"
+                f"💎 **سود خالص شما از این سفارش:** `{to_fa_num(fin['net_profit'], comma=True)} ریال`\n\n"
+                "📌 این سفارش به لیست **«💳 سفارشات تسویه‌نشده با کارخانه»** منتقل شد."
+            )
+            kb_after_paid = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "💳 مشاهده سفارشات تسویه‌نشده با کارخانه",
+                            callback_data="acc_menu_unsettled:0",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "📂 بازگشت به سفارش‌های باز",
+                            callback_data="acc_menu_open:0",
+                        )
+                    ],
+                ]
+            )
+            if query.message.document or query.message.photo:
+                await query.message.reply_text(msg_paid, parse_mode="Markdown", reply_markup=kb_after_paid)
+            else:
+                await query.edit_message_text(msg_paid, parse_mode="Markdown", reply_markup=kb_after_paid)
+            return
+
+        if data.startswith("acc_del_open:"):
+            oid = data.split(":")[1]
+            rec = ACCOUNTING_ORDERS.pop(str(oid), None)
+            ACTIVE_PAYMENT_ORDERS.pop(str(oid), None)
+            ADMIN_SELECTED_SETTLE_OIDS.discard(str(oid))
+            save_accounting_db()
+            await query.answer(f"🗑 سفارش باز #{to_fa_num(oid)} حذف شد.", show_alert=True)
+            txt, kb = build_open_orders_list_text_and_kb(page=0)
+            if query.message.document or query.message.photo:
+                await query.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+            else:
+                await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            return
+
+        if data.startswith("acc_menu_unsettled:"):
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            page = int(data.split(":")[1])
+            txt, kb = build_unsettled_orders_text_and_kb(page=page)
+            if query.message.document or query.message.photo:
+                await query.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+            else:
+                await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            return
+
+        if data.startswith("acc_toggle_sel:"):
+            _, oid, page_s = data.split(":")
+            oid = str(oid)
+            if oid in ADMIN_SELECTED_SETTLE_OIDS:
+                ADMIN_SELECTED_SETTLE_OIDS.discard(oid)
+            else:
+                ADMIN_SELECTED_SETTLE_OIDS.add(oid)
+            await query.answer()
+            txt, kb = build_unsettled_orders_text_and_kb(page=int(page_s))
+            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            return
+
+        if data.startswith("acc_sel_all:"):
+            page = int(data.split(":")[1])
+            for rec in get_orders_by_acc_status("paid_unsettled"):
+                ADMIN_SELECTED_SETTLE_OIDS.add(str(rec["order_id"]))
+            await query.answer("☑️ همه سفارشات تسویه‌نشده انتخاب شدند.")
+            txt, kb = build_unsettled_orders_text_and_kb(page=page)
+            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            return
+
+        if data.startswith("acc_unsel_all:"):
+            page = int(data.split(":")[1])
+            ADMIN_SELECTED_SETTLE_OIDS.clear()
+            await query.answer("⬜️ انتخاب همه لغو شد.")
+            txt, kb = build_unsettled_orders_text_and_kb(page=page)
+            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            return
+
+        if data.startswith("acc_view_unsettled:"):
+            oid = data.split(":")[1]
+            rec = ACCOUNTING_ORDERS.get(str(oid))
+            if not rec:
+                await query.answer("⚠️ سفارش یافت نشد.", show_alert=True)
+                return
+            await query.answer()
+            od = rec["order_data"]
+            fin = calculate_order_financials(od["items"], order_data=od)
+            carton_stats = calculate_order_cartons(od["items"])
+            txt = (
+                f"💳 **جزئیات سفارش تسویه‌نشده `#{to_fa_num(oid)}`**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 **مشتری:** `{od.get('customer_title', '')}`\n"
+                f"📅 **تاریخ پرداخت مشتری:** `{to_fa_num(rec.get('paid_at') or od.get('date', ''))}`\n"
+                f"📦 **تعداد کل:** `{to_fa_num(fin['total_qty'])} دست` (`{carton_stats['summary_full']}`)\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 **دریافتی از مشتری:** `{to_fa_num(fin['total_payable'], comma=True)} ریال`\n"
+                f"🏭 **قیمت لیست کارخانه:** `{to_fa_num(fin['factory_list_total'], comma=True)} ریال`\n"
+                f"🎁 **۲۰٪ تخفیف کارخانه:** `{to_fa_num(fin['factory_discount_amount'], comma=True)} ریال`\n"
+                f"💳 **مبلغ قابل پرداخت به کارخانه:** `{to_fa_num(fin['factory_payable_total'], comma=True)} ریال`\n"
+                f"💎 **سود خالص شما:** `{to_fa_num(fin['net_profit'], comma=True)} ریال`"
+            )
+            kb = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🧾 تسویه همین سفارش با کارخانه (صدور فاکتور ۲۰٪ تخفیف)",
+                            callback_data=f"acc_settle_one:{oid}",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton("📥 دریافت PDF فاکتور مشتری", callback_data=f"acc_dl_pdf:{oid}"),
+                        InlineKeyboardButton("↩️ بازگردانی به سفارش باز", callback_data=f"acc_reopen_unsettled:{oid}"),
+                    ],
+                    [
+                        InlineKeyboardButton("🔙 بازگشت به لیست تسویه‌نشده‌ها", callback_data="acc_menu_unsettled:0")
+                    ],
+                ]
+            )
+            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            return
+
+        if data.startswith("acc_reopen_unsettled:"):
+            oid = data.split(":")[1]
+            rec = ACCOUNTING_ORDERS.get(str(oid))
+            if rec:
+                rec["acc_status"] = "open"
+                ADMIN_SELECTED_SETTLE_OIDS.discard(str(oid))
+                save_accounting_db()
+            await query.answer("↩️ سفارش به لیست سفارش‌های باز منتقل شد.")
+            txt, kb = build_unsettled_orders_text_and_kb(page=0)
+            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            return
+
+        if data in ("acc_settle_selected", "acc_settle_all") or data.startswith("acc_settle_one:"):
+            global SETTLEMENT_BATCH_COUNTER
+            unsettled_list = get_orders_by_acc_status("paid_unsettled")
+            if data == "acc_settle_all":
+                target_records = unsettled_list
+            elif data.startswith("acc_settle_one:"):
+                one_oid = data.split(":")[1]
+                target_records = [r for r in unsettled_list if str(r["order_id"]) == str(one_oid)]
+            else:
+                target_records = [r for r in unsettled_list if str(r["order_id"]) in ADMIN_SELECTED_SETTLE_OIDS]
+
+            if not target_records:
+                await query.answer("⚠️ لطفاً حداقل یک سفارش را برای تسویه انتخاب کنید.", show_alert=True)
+                return
+
+            SETTLEMENT_BATCH_COUNTER += 1
+            batch_id = str(SETTLEMENT_BATCH_COUNTER)
+            await query.answer("⏳ در حال صدور فاکتور تسویه با کارخانه (با ۲۰٪ تخفیف)...")
+
+            try:
+                pdf_bytes, summary = generate_factory_settlement_pdf_bytes(target_records, batch_id)
+                today_j = get_today_jalali()
+                for rec in target_records:
+                    rec["acc_status"] = "settled_archived"
+                    rec["settled_at"] = today_j
+                    rec["settlement_batch_id"] = batch_id
+                    ADMIN_SELECTED_SETTLE_OIDS.discard(str(rec["order_id"]))
+                save_accounting_db()
+
+                oids_str = "، ".join(summary["order_ids"])
+                cap = (
+                    f"🏭 **فاکتور رسمی تسویه با کارخانه (با ۲۰٪ تخفیف همکاری)**\n"
+                    f"🔢 **شماره تسویه:** `#{to_fa_num(batch_id)}` | 📅 **تاریخ:** `{to_fa_num(today_j)}`\n"
+                    f"📋 **سفارش‌های تسویه‌شده ({to_fa_num(summary['orders_count'])} سفارش):** `{oids_str}`\n"
+                    f"📦 **تعداد کل لنت‌ها:** `{to_fa_num(summary['total_sets'])} دست` (`{summary['carton_summary']}`)\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💰 **مجموع دریافتی شما از مشتریان:** `{to_fa_num(summary['total_customer_revenue'], comma=True)} ریال`\n"
+                    f"🏭 **جمع به قیمت لیست کارخانه:** `{to_fa_num(summary['total_factory_list'], comma=True)} ریال`\n"
+                    f"🎁 **کسر ۲۰٪ تخفیف کارخانه:** `-{to_fa_num(summary['total_factory_discount'], comma=True)} ریال`\n"
+                    f"💳 **مبلغ خالص قابل پرداخت به کارخانه:**\n"
+                    f"   **`{to_fa_num(summary['total_factory_payable'], comma=True)} ریال`** (`{to_fa_num(summary['total_factory_payable'] // 10, comma=True)} تومان`)\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"💎 **سود خالص قطعی شما از این تسویه:**\n"
+                    f"   **`{to_fa_num(summary['net_profit'], comma=True)} ریال`** (`{to_fa_num(summary['net_profit'] // 10, comma=True)} تومان`)\n\n"
+                    "🗄 _سفارش‌های بالا با موفقیت به بخش «بایگانی سفارشات تسویه‌شده» منتقل شدند._"
+                )
+                kb_done = InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("🗄 مشاهده بایگانی تسویه‌شده‌ها", callback_data="acc_menu_archived:0")],
+                        [InlineKeyboardButton("💳 بازگشت به سفارشات تسویه‌نشده", callback_data="acc_menu_unsettled:0")],
+                        [InlineKeyboardButton("💼 داشبورد حسابداری", callback_data="acc_dashboard")],
+                    ]
+                )
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=io.BytesIO(pdf_bytes),
+                    filename=f"فاکتور تسویه کارخانه (۲۰ درصد تخفیف) - کد {batch_id}.pdf",
+                    caption=cap,
+                    parse_mode="Markdown",
+                    reply_markup=kb_done,
+                )
+                txt_rem, kb_rem = build_unsettled_orders_text_and_kb(page=0)
+                if not (query.message.document or query.message.photo):
+                    await query.edit_message_text(txt_rem, parse_mode="Markdown", reply_markup=kb_rem)
+            except Exception as e:
+                logger.exception("Error generating factory settlement invoice")
+                await query.message.reply_text(f"❌ خطا در صدور فاکتور تسویه کارخانه: `{e}`", parse_mode="Markdown")
+            return
+
+        if data.startswith("acc_menu_archived:"):
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            page = int(data.split(":")[1])
+            txt, kb = build_archived_orders_text_and_kb(page=page)
+            if query.message.document or query.message.photo:
+                await query.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+            else:
+                await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            return
+
+        if data.startswith("acc_unarchive:"):
+            oid = data.split(":")[1]
+            rec = ACCOUNTING_ORDERS.get(str(oid))
+            if rec:
+                rec["acc_status"] = "paid_unsettled"
+                save_accounting_db()
+            await query.answer("↩️ سفارش به لیست تسویه‌نشده‌ها بازگردانده شد.")
+            txt, kb = build_archived_orders_text_and_kb(page=0)
+            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            return
+
+        if data.startswith("acc_menu_stats:"):
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            m_key = data.split(":", 1)[1]
+            txt, kb = build_monthly_stats_text_and_kb(month_key=m_key)
+            if query.message.document or query.message.photo:
+                await query.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+            else:
+                await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            return
 
     if data == "already_sent_noop":
         await query.answer("✅ این پیش‌فاکتور قبلاً برای مدیریت ارسال شده است.", show_alert=True)
@@ -4200,6 +5708,41 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         PENDING_DRAFT_ORDERS.pop(chat_id, None)
         USER_EDIT_STATE.pop(chat_id, None)
+
+        # اگر مدیر در حال اصلاح یک «سفارش باز» از بخش حسابداری بوده است:
+        editing_oid = draft.get("editing_accounting_oid")
+        if editing_oid and user_id == ADMIN_TELEGRAM_ID and str(editing_oid) in ACCOUNTING_ORDERS:
+            oid_str = str(editing_oid)
+            rec = ACCOUNTING_ORDERS[oid_str]
+            apply_order_mode_pricing_to_items(draft["items"], order_mode=draft.get("order_mode", "wholesale"))
+            rec["order_data"] = draft
+            ACTIVE_PAYMENT_ORDERS[oid_str] = rec
+            LAST_ORDERS[chat_id] = draft
+            save_accounting_db()
+            await query.edit_message_text(f"⏳ در حال ذخیره تغییرات و صدور مجدد PDF سفارش باز `#{to_fa_num(oid_str)}`...", parse_mode="Markdown")
+            try:
+                pdf_bytes = generate_pdf_bytes(draft)
+                doc_t = draft.get("doc_type", "پیش‌فاکتور")
+                cust = draft.get("customer_title", "مشتری")
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=io.BytesIO(pdf_bytes),
+                    filename=f"{doc_t} اصلاح‌شده سفارش {cust} - کد {oid_str}.pdf",
+                    caption=f"✅ تغییرات سفارش باز `#{to_fa_num(oid_str)}` با موفقیت ذخیره شد.",
+                    parse_mode="Markdown",
+                )
+                txt_open, kb_open = build_single_open_order_text_and_kb(oid_str)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=txt_open,
+                    parse_mode="Markdown",
+                    reply_markup=kb_open,
+                )
+                await query.message.delete()
+            except Exception as e:
+                logger.exception("Error saving edited open order")
+                await query.edit_message_text(f"❌ خطا در ذخیره سفارش باز: `{e}`", parse_mode="Markdown")
+            return
 
         # اعمال قانون حداقل ۱۵ دست برای سفارش عمده قبل از صدور پیش‌فاکتور/فاکتور
         auto_notice = enforce_wholesale_minimum_rule(draft, chat_id)
@@ -5012,11 +6555,13 @@ def start_health_server():
 
 
 def main():
+    load_accounting_db()
     start_health_server()
-    print("🚀 ربات صدور فاکتور کیالنت البرز نور (نسخه ۲ صفحه‌ای با پشتیبانی از ویس و عکس) در حال اجراست...")
+    print("🚀 ربات صدور فاکتور و حسابداری کیالنت البرز نور (نسخه ۲ صفحه‌ای با پشتیبانی از ویس و عکس) در حال اجراست...")
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("accounting", accounting_cmd))
     app.add_handler(CommandHandler("setbank", set_bank_cmd))
     app.add_handler(CommandHandler("setgemini", set_gemini_cmd))
     app.add_handler(CommandHandler("clearwelcome", clear_welcome_cmd))
